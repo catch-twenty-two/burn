@@ -182,17 +182,16 @@ impl<R: InjectableTraits> Augmentations<R> {
         }
 
         if self.uniform_outcome_prob(p) {
-            let r_contrast = self
-                .rng
-                .get_random_with_range(contrast.0.clamp(-100.0, 100.0)..contrast.1.clamp(-100.0 , 100.0))                
-                * 100.0;
+            let r_contrast = self.rng.get_random_with_range(
+                contrast.0.clamp(-100.0, 100.0)..contrast.1.clamp(-100.0, 100.0),
+            ) * 100.0;
             img_tensor = image_ops::contrast(img_tensor, r_contrast);
         }
 
         if self.uniform_outcome_prob(p) {
             let r_hue_rot = self
                 .rng
-                .get_random_with_range(hue.0.clamp(-180.0, 180.0)..hue.1.clamp(-180.0,180.0));
+                .get_random_with_range(hue.0.clamp(-180.0, 180.0)..hue.1.clamp(-180.0, 180.0));
 
             img_tensor = image_ops::hue_rotate(img_tensor, r_hue_rot);
         }
@@ -230,11 +229,11 @@ impl<R: InjectableTraits> Augmentations<R> {
     /// - This is useful for improving model robustness to scale and context variation.
     pub fn random_zoom_out<B: Backend>(
         &mut self,
-        img_data: (Tensor<B, 3>, Option<Tensor<B, 1>>),
+        img_data: (Tensor<B, 3>, Option<Vec<Tensor<B, 1>>>),
         fill: u8,
         side_range: (f32, f32),
         p: f32,
-    ) -> (Tensor<B, 3>, Option<Tensor<B, 1>>) {
+    ) -> (Tensor<B, 3>, Option<Vec<Tensor<B, 1>>>) {
         if !self.uniform_outcome_prob(p) {
             return img_data;
         }
@@ -265,12 +264,14 @@ impl<R: InjectableTraits> Augmentations<R> {
 
         // Translate bounding box
 
-        let mut new_bbox_t = Option::<Tensor<B, 1>>::None;
+        let mut new_bbox_t = Option<Vec<Tensor<B, 1>>>::None;
 
         if let Some(old_bb_t) = maybe_bbox_t.as_mut() {
             let device = B::Device::default();
-            let shift = Tensor::<B, 1>::from_data([left as f32, top as f32, 0.0, 0.0], &device);
-            new_bbox_t = Some(old_bb_t.clone().add(shift));
+            for bbox in old_bb_t.iter() {                 
+                let shift = Tensor::<B, 1>::from_data([left as f32, top as f32, 0.0, 0.0], &device);
+                new_bbox_t = Some(bbox.clone().add(shift));
+            }
         }
 
         (image_t, new_bbox_t)
@@ -293,9 +294,9 @@ impl<R: InjectableTraits> Augmentations<R> {
     /// If the operation is not applied (based on the probability), the original image is returned unchanged.
     pub fn random_vertical_flip<B: Backend>(
         &mut self,
-        img_data: (Tensor<B, 3>, Option<Tensor<B, 1>>),
+        img_data: (Tensor<B, 3>, Option<Vec<Tensor<B, 1>>>),
         p: f32,
-    ) -> (Tensor<B, 3>, Option<Tensor<B, 1>>) {
+    ) -> (Tensor<B, 3>, Option<Vec<Tensor<B, 1>>>) {
         if !self.uniform_outcome_prob(p) {
             return img_data;
         }
@@ -306,7 +307,7 @@ impl<R: InjectableTraits> Augmentations<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vision::{BoundingBox, debug_utils};
+    use crate::vision::BoundingBox;
     use burn_ndarray::NdArray;
     use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -329,16 +330,27 @@ mod tests {
     fn random_zoom_test() {
         let img = image_ops::create_test_image(15, 11, [1, 2, 3]);
 
+        let mut bb_list = Vec::<Tensor<NdArray<f32>, 1>>::new();
+
         let bb = BoundingBox {
             coords: [210.0, 150.0, 140.0, 280.0],
             label: 0,
         };
 
+        bb_list.push(image_ops::bbox_as_tensor::<NdArray<f32>>(bb));
+
+        let bb = BoundingBox {
+            coords: [1.0, 2.0, 3.0, 4.0],
+            label: 0,
+        };
+
+        bb_list.push(image_ops::bbox_as_tensor::<NdArray<f32>>(bb));
+
         let mut aug = Augmentations::new(SeededRng::new(3));
 
         let image_t = image_ops::rgb_img_as_tensor::<NdArray<f32>, f32>(img);
         let bbox_t = image_ops::bbox_as_tensor(bb);
-        let img_data = aug.random_zoom_out::<NdArray>((image_t, bbox_t), 0, (1.0, 4.0), 1.0);
+        let img_data = aug.random_zoom_out::<NdArray>((image_t, Some(bb_list)), 0, (1.0, 4.0), 1.0);
 
         let (img_tensor, bb_tensor) = img_data;
 
