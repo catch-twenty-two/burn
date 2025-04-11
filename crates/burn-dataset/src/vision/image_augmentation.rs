@@ -82,7 +82,6 @@ impl InjectableTraits for SeededRng {
 /// # Notes
 ///
 /// - Augmentations are applied probabilistically and may vary on each call.
-/// - Designed to be composable and easily integrated into preprocessing pipelines.
 /// - Aims to improve model robustness to lighting, scale, and spatial orientation.
 #[derive(Clone, Debug)]
 pub struct Augmentations<R: InjectableTraits = RngDefault> {
@@ -171,33 +170,32 @@ impl<R: InjectableTraits> Augmentations<R> {
         hue: (f32, f32),
         p: f32,
     ) -> Tensor<B, 3> {
-        let mut img_tensor = img_tensor.clone();
+        let mut img_tnsr = img_tensor.clone();
 
         if self.uniform_outcome_prob(p) {
             let r_bright = (self
                 .rng
                 .get_random_with_range(brightness.0.clamp(0.0, 1.0)..brightness.1.clamp(0.0, 1.0))
                 * 255.0) as i32;
-            img_tensor = image_ops::brighten(img_tensor, r_bright);
+            img_tnsr = image_ops::brighten(img_tnsr, r_bright);
         }
 
         if self.uniform_outcome_prob(p) {
-            let r_contrast = self
-                .rng
-                .get_random_with_range(contrast.0.clamp(-100.0, 100.0)..contrast.1.clamp(-100.0 , 100.0))                
-                * 100.0;
-            img_tensor = image_ops::contrast(img_tensor, r_contrast);
+            let r_contrast = self.rng.get_random_with_range(
+                contrast.0.clamp(-100.0, 100.0)..contrast.1.clamp(-100.0, 100.0),
+            ) * 100.0;
+            img_tnsr = image_ops::contrast(img_tnsr, r_contrast);
         }
 
         if self.uniform_outcome_prob(p) {
             let r_hue_rot = self
                 .rng
-                .get_random_with_range(hue.0.clamp(-180.0, 180.0)..hue.1.clamp(-180.0,180.0));
+                .get_random_with_range(hue.0.clamp(-180.0, 180.0)..hue.1.clamp(-180.0, 180.0));
 
-            img_tensor = image_ops::hue_rotate(img_tensor, r_hue_rot);
+            img_tnsr = image_ops::hue_rotate(img_tnsr, r_hue_rot);
         }
 
-        img_tensor
+        img_tnsr
     }
 
     /// Applies a "zoom out" transformation by randomly padding the image, as described in
@@ -230,18 +228,18 @@ impl<R: InjectableTraits> Augmentations<R> {
     /// - This is useful for improving model robustness to scale and context variation.
     pub fn random_zoom_out<B: Backend>(
         &mut self,
-        img_data: (Tensor<B, 3>, Option<Tensor<B, 1>>),
+        img_data: (Tensor<B, 3>, Option<Vec<Tensor<B, 1>>>),
         fill: u8,
         side_range: (f32, f32),
         p: f32,
-    ) -> (Tensor<B, 3>, Option<Tensor<B, 1>>) {
+    ) -> (Tensor<B, 3>, Option<Vec<Tensor<B, 1>>>) {
         if !self.uniform_outcome_prob(p) {
             return img_data;
         }
 
-        let (image_t, mut maybe_bbox_t) = img_data;
-        let [_ch, height, width] = image_t.dims();
-        println!("{_ch},{height},{width}");
+        let (cur_img_tnsr, mut maybe_bb_tnsr_list) = img_data;
+        let [_ch, height, width] = cur_img_tnsr.dims();
+
         if side_range.0 < 1.0 || side_range.0 > side_range.1 {
             panic!("Invalid side range provided {:#?}.", side_range);
         }
@@ -258,22 +256,27 @@ impl<R: InjectableTraits> Augmentations<R> {
         let right = canvas_width - (left + width);
         let bottom = canvas_height - (top + height);
 
-        let image_t = image_t.pad(
+        // Pad image
+        let new_img_tnsr = cur_img_tnsr.pad(
             (left, right, top, bottom),
             ElementConversion::elem::<f32>(fill as f32),
         );
 
         // Translate bounding box
+        let mut new_bbox_tnsr_list = Option::<Vec<Tensor<B, 1>>>::None;
 
-        let mut new_bbox_t = Option::<Tensor<B, 1>>::None;
-
-        if let Some(old_bb_t) = maybe_bbox_t.as_mut() {
+        if let Some(cur_bb_t_list) = maybe_bb_tnsr_list.as_mut() {
             let device = B::Device::default();
-            let shift = Tensor::<B, 1>::from_data([left as f32, top as f32, 0.0, 0.0], &device);
-            new_bbox_t = Some(old_bb_t.clone().add(shift));
+            let mut tmp_bb_tnsr_list = Vec::<Tensor<B, 1>>::new();
+            for bbox in cur_bb_t_list.iter() {
+                let trans = Tensor::<B, 1>::from_data([left as f32, top as f32, 0.0, 0.0], &device);
+                tmp_bb_tnsr_list.push(bbox.clone().add(trans));
+            }
+
+            new_bbox_tnsr_list = Some(tmp_bb_tnsr_list);
         }
 
-        (image_t, new_bbox_t)
+        (new_img_tnsr, new_bbox_tnsr_list)
     }
 
     /// Flips an RGB image vertically with a given probability.
@@ -293,9 +296,9 @@ impl<R: InjectableTraits> Augmentations<R> {
     /// If the operation is not applied (based on the probability), the original image is returned unchanged.
     pub fn random_vertical_flip<B: Backend>(
         &mut self,
-        img_data: (Tensor<B, 3>, Option<Tensor<B, 1>>),
+        img_data: (Tensor<B, 3>, Option<Vec<Tensor<B, 1>>>),
         p: f32,
-    ) -> (Tensor<B, 3>, Option<Tensor<B, 1>>) {
+    ) -> (Tensor<B, 3>, Option<Vec<Tensor<B, 1>>>) {
         if !self.uniform_outcome_prob(p) {
             return img_data;
         }
@@ -306,7 +309,7 @@ impl<R: InjectableTraits> Augmentations<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vision::{BoundingBox, debug_utils};
+    use crate::vision::BoundingBox;
     use burn_ndarray::NdArray;
     use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -320,8 +323,6 @@ mod tests {
             test_vec.push(mse.get_random::<i32>());
         }
 
-        let mut h = DefaultHasher::new();
-        test_vec.hash(&mut h);
         assert_eq!(expected_vec, test_vec);
     }
 
@@ -329,28 +330,47 @@ mod tests {
     fn random_zoom_test() {
         let img = image_ops::create_test_image(15, 11, [1, 2, 3]);
 
+        let mut bb_list = Vec::<Tensor<NdArray<f32>, 1>>::new();
+
         let bb = BoundingBox {
-            coords: [210.0, 150.0, 140.0, 280.0],
+            coords: [3.0, 4.0, 2.0, 2.0],
             label: 0,
         };
 
+        bb_list.push(image_ops::bbox_as_tensor::<NdArray<f32>>(bb));
+
+        let bb = BoundingBox {
+            coords: [1.0, 2.0, 3.0, 4.0],
+            label: 0,
+        };
+
+        bb_list.push(image_ops::bbox_as_tensor::<NdArray<f32>>(bb));
+
         let mut aug = Augmentations::new(SeededRng::new(3));
 
-        let image_t = image_ops::rgb_img_as_tensor::<NdArray<f32>, f32>(img);
-        let bbox_t = image_ops::bbox_as_tensor(bb);
-        let img_data = aug.random_zoom_out::<NdArray>((image_t, bbox_t), 0, (1.0, 4.0), 1.0);
+        let image_t = image_ops::rgb_img_as_tensor::<NdArray>(img);
 
-        let (img_tensor, bb_tensor) = img_data;
+        let (img_tensor, bb_tlist) =
+            aug.random_zoom_out::<NdArray>((image_t, Some(bb_list)), 0, (1.0, 4.0), 1.0);
 
+        // Check image test result
         let test_success_hash: u64 = 9409394306101858683;
         let mut h = DefaultHasher::new();
         img_tensor.into_data().as_bytes().hash(&mut h);
         assert_eq!(test_success_hash, h.finish());
 
-        let test_success_hash = 607248611935476890;
-        let mut h = DefaultHasher::new();
-        bb_tensor.unwrap().into_data().as_bytes().hash(&mut h);
-        assert_eq!(test_success_hash, h.finish());
+        // Check bounding box translations
+        let bb_vec = bb_tlist.unwrap();
+
+        let eq_test_t = bb_vec[0].to_data();
+        let eq_test_t = eq_test_t.as_slice::<f32>().unwrap();
+
+        assert_eq!(eq_test_t == [1.0, 5.0, 6.0, 6.0], true);
+
+        let eq_test_t = bb_vec[1].to_data();
+        let eq_test_t = eq_test_t.as_slice::<f32>().unwrap();
+
+        assert_eq!(eq_test_t == [1.0, 6.0, 3.0, 4.0], true);
     }
 
     #[test]
@@ -358,14 +378,14 @@ mod tests {
         let img = image_ops::create_test_image(12, 12, [128, 128, 255]);
         let test_success_hash: u64 = 9511505080464416096;
 
-        let image_t = image_ops::rgb_img_as_tensor::<NdArray<f32>, f32>(img);
+        let image_t = image_ops::rgb_img_as_tensor::<NdArray<f32>>(img);
         let mut aug = Augmentations::new(SeededRng::new(3));
 
         let image_t =
             aug.random_photometric_distort(image_t, (0.0, 0.3), (-0.5, 0.5), (0.0, 1.0), 0.5);
 
+        // Test hash of image
         let mut h = DefaultHasher::new();
-        debug_utils::print_tensor_img::<NdArray<f32>>(&image_t);
         image_t.to_data().as_bytes().hash(&mut h);
         assert_eq!(test_success_hash, h.finish());
     }

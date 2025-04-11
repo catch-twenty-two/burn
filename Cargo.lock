@@ -733,6 +733,8 @@ name = "burn-dataset"
 version = "0.17.0"
 dependencies = [
  "burn-common",
+ "burn-ndarray",
+ "burn-tensor",
  "csv",
  "derive-new 0.7.0",
  "dirs 6.0.0",
