@@ -1,15 +1,15 @@
-use crate::burn::ToTokens;
 use proc_macro2::Ident;
 use proc_macro2::Span;
 use proc_macro2::TokenStream;
 use quote::quote;
+
+use crate::burn::ToTokens;
 
 #[derive(Debug, Clone)]
 pub struct TensorType {
     pub name: Ident,
     pub rank: usize,
     pub kind: TensorKind,
-    pub shape: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,14 +63,24 @@ pub enum Type {
 
 impl Type {
     // This is used, because types might have number literal name, which cannot be
-    // used as a variable name.
+    // used as a variable name, or contain invalid identifier characters.
+    // TODO (antimora) push the name sanitization upstream to onnx-ir; this is simple for now
     pub fn format_name(name: &str) -> String {
-        let name_is_number = name.bytes().all(|digit| digit.is_ascii_digit());
-        if name_is_number {
-            format!("_{}", name)
-        } else {
-            name.to_string()
+        let mut result = String::with_capacity(name.len());
+        // Sanitize the name by replacing invalid identifier characters with underscores
+        for c in name.chars() {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                result.push(c);
+            } else {
+                result.push('_');
+            }
         }
+
+        // Ensure the first character is valid to start an identifier
+        if !result.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+            result = format!("_{result}");
+        }
+        result
     }
     pub fn name(&self) -> &Ident {
         match self {
@@ -114,7 +124,7 @@ impl Type {
 impl ScalarType {
     pub fn new<S: AsRef<str>>(name: S, kind: ScalarKind) -> Self {
         if name.as_ref().is_empty() {
-            panic!("Scalar of Type {:?} was passed with empty name", kind);
+            panic!("Scalar of Type {kind:?} was passed with empty name");
         }
 
         let formatted_name = Type::format_name(name.as_ref());
@@ -157,19 +167,20 @@ impl ScalarType {
 }
 
 impl ShapeType {
-    pub fn new<S: AsRef<str>>(name: S, dim: usize) -> Self {
+    pub fn new<S: AsRef<str>>(name: S, rank: usize) -> Self {
         if name.as_ref().is_empty() {
             panic!("Shape was passed with empty name");
         }
         let formatted_name = Type::format_name(name.as_ref());
         Self {
             name: Ident::new(&formatted_name, Span::call_site()),
-            rank: dim,
+            rank,
         }
     }
     pub fn ty(&self) -> TokenStream {
-        let dim = self.rank.to_tokens();
-        quote! { [usize; #dim] }
+        let rank = self.rank.to_tokens();
+
+        quote! { [usize; #rank] }
     }
 
     /// Helper for Ops that need to process a shape as a tensor on device
@@ -185,65 +196,31 @@ impl ShapeType {
 }
 
 impl TensorType {
-    pub fn new<S: AsRef<str>>(
-        name: S,
-        dim: usize,
-        kind: TensorKind,
-        shape: Option<Vec<usize>>,
-    ) -> Self {
+    pub fn new<S: AsRef<str>>(name: S, rank: usize, kind: TensorKind) -> Self {
         if name.as_ref().is_empty() {
-            panic!(
-                "Tensor of Kind {:?} with dim shape {:?} was passed with empty name",
-                kind, shape
-            );
+            panic!("Tensor of Kind {kind:?} was passed with empty name");
         }
         let formatted_name = Type::format_name(name.as_ref());
-
         assert_ne!(
-            dim, 0,
+            rank, 0,
             "Trying to create TensorType with dim = 0 - should be a Scalar instead!"
         );
         Self {
             name: Ident::new(&formatted_name, Span::call_site()),
-            rank: dim,
+            rank,
             kind,
-            shape,
         }
     }
-    pub fn new_float<S: AsRef<str>>(name: S, dim: usize) -> Self {
-        Self::new_float_with_shape(name, dim, None)
+    pub fn new_float<S: AsRef<str>>(name: S, rank: usize) -> Self {
+        Self::new(name, rank, TensorKind::Float)
     }
 
-    pub fn new_float_with_shape<S: AsRef<str>>(
-        name: S,
-        dim: usize,
-        shape: Option<Vec<usize>>,
-    ) -> Self {
-        Self::new(name, dim, TensorKind::Float, shape)
+    pub fn new_int<S: AsRef<str>>(name: S, rank: usize) -> Self {
+        Self::new(name, rank, TensorKind::Int)
     }
 
-    pub fn new_int<S: AsRef<str>>(name: S, dim: usize) -> Self {
-        Self::new_int_with_shape(name, dim, None)
-    }
-
-    pub fn new_int_with_shape<S: AsRef<str>>(
-        name: S,
-        dim: usize,
-        shape: Option<Vec<usize>>,
-    ) -> Self {
-        Self::new(name, dim, TensorKind::Int, shape)
-    }
-
-    pub fn new_bool<S: AsRef<str>>(name: S, dim: usize) -> Self {
-        Self::new_bool_with_shape(name, dim, None)
-    }
-
-    pub fn new_bool_with_shape<S: AsRef<str>>(
-        name: S,
-        dim: usize,
-        shape: Option<Vec<usize>>,
-    ) -> Self {
-        Self::new(name, dim, TensorKind::Bool, shape)
+    pub fn new_bool<S: AsRef<str>>(name: S, rank: usize) -> Self {
+        Self::new(name, rank, TensorKind::Bool)
     }
 
     pub fn ty(&self) -> TokenStream {
@@ -274,10 +251,7 @@ impl TensorType {
 impl OtherType {
     pub fn new<S: AsRef<str>>(name: S, tokens: TokenStream) -> Self {
         if name.as_ref().is_empty() {
-            panic!(
-                "Other type with tokens {:?} was passed with empty name",
-                tokens
-            );
+            panic!("Other type with tokens {tokens:?} was passed with empty name");
         }
         let formatted_name = Type::format_name(name.as_ref());
         Self {
@@ -287,5 +261,55 @@ impl OtherType {
     }
     pub fn ty(&self) -> TokenStream {
         self.ty.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_name_with_problematic_characters() {
+        // Test the problematic node name from GitHub issue #2878
+        let problematic_name = "jax2tf_rhs_/pjit_silu_/Const_2:0";
+        let sanitized = Type::format_name(problematic_name);
+        assert_eq!(sanitized, "jax2tf_rhs__pjit_silu__Const_2_0");
+    }
+
+    #[test]
+    fn test_format_name_edge_cases() {
+        // Test various edge cases
+        assert_eq!(Type::format_name("normal_name"), "normal_name");
+        assert_eq!(Type::format_name("123"), "_123");
+        assert_eq!(Type::format_name("name:with:colons"), "name_with_colons");
+        assert_eq!(Type::format_name("name/with/slashes"), "name_with_slashes");
+        assert_eq!(Type::format_name("name-with-dashes"), "name_with_dashes");
+        assert_eq!(Type::format_name("name.with.dots"), "name_with_dots");
+        assert_eq!(Type::format_name("name with spaces"), "name_with_spaces");
+        assert_eq!(
+            Type::format_name("9starts_with_number"),
+            "_9starts_with_number"
+        );
+        assert_eq!(
+            Type::format_name(":starts_with_colon"),
+            "_starts_with_colon"
+        );
+    }
+
+    #[test]
+    fn test_format_name_preserves_valid_identifiers() {
+        // Test that valid identifiers are preserved
+        assert_eq!(Type::format_name("valid_name"), "valid_name");
+        assert_eq!(Type::format_name("_underscore_start"), "_underscore_start");
+        assert_eq!(Type::format_name("CamelCase"), "CamelCase");
+        assert_eq!(Type::format_name("snake_case"), "snake_case");
+        assert_eq!(Type::format_name("name123"), "name123");
+    }
+
+    #[test]
+    fn test_tensor_type_creation_with_problematic_name() {
+        // Test that TensorType can be created with problematic names
+        let tensor = TensorType::new("jax2tf_rhs_/pjit_silu_/Const_2:0", 2, TensorKind::Float);
+        assert_eq!(tensor.name.to_string(), "jax2tf_rhs__pjit_silu__Const_2_0");
     }
 }

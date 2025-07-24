@@ -10,7 +10,7 @@ use super::{
 use crate::config::Config;
 use crate::optim::adaptor::OptimizerAdaptor;
 use crate::tensor::{Tensor, backend::AutodiffBackend};
-use burn_tensor::{ElementConversion, backend::Backend, ops::Device};
+use burn_tensor::{backend::Backend, ops::Device};
 
 #[cfg(not(feature = "std"))]
 use num_traits::Float;
@@ -140,7 +140,7 @@ impl AdaptiveMomentum {
             state.moment_2 = state
                 .moment_2
                 .mul_scalar(self.beta_2)
-                .add(grad.powf_scalar(2.0).mul_scalar(factor));
+                .add(grad.powi_scalar(2).mul_scalar(factor));
 
             state.time += 1;
 
@@ -150,12 +150,12 @@ impl AdaptiveMomentum {
             let moment_1 = grad.clone().mul_scalar(factor);
 
             let factor = 1.0 - self.beta_2;
-            let moment_2 = grad.powf_scalar(2.0).mul_scalar(factor);
+            let moment_2 = grad.powi_scalar(2).mul_scalar(factor);
 
             AdaptiveMomentumState::new(1, moment_1, moment_2)
         };
 
-        let time = (state.time as i32).elem();
+        let time = state.time as i32;
         let moment_1_corrected = state
             .moment_1
             .clone()
@@ -190,6 +190,9 @@ impl<B: Backend, const D: usize> AdaptiveMomentumState<B, D> {
 
 #[cfg(test)]
 mod tests {
+    use burn_tensor::Tolerance;
+    use burn_tensor::ops::FloatElem;
+
     use super::*;
     use crate::module::{Module, Param};
     use crate::optim::{GradientsParams, Optimizer};
@@ -237,7 +240,6 @@ mod tests {
 
         assert_eq!(state_optim_before.len(), state_optim_after.len());
     }
-    const ASSERT_PRECISION: usize = 2;
 
     #[test]
     fn test_adam_optimizer_with_numbers() {
@@ -311,8 +313,10 @@ mod tests {
             state_updated.bias.unwrap().to_data(),
         );
 
-        bias_updated.assert_approx_eq(&bias_expected, ASSERT_PRECISION);
-        weight_updated.assert_approx_eq(&weights_expected, ASSERT_PRECISION);
+        type FT = FloatElem<TestAutodiffBackend>;
+        let tolerance = Tolerance::absolute(1e-2);
+        bias_updated.assert_approx_eq::<FT>(&bias_expected, tolerance);
+        weight_updated.assert_approx_eq::<FT>(&weights_expected, tolerance);
     }
 
     #[test]

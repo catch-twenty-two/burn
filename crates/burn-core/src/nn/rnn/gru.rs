@@ -246,6 +246,8 @@ mod tests {
     use super::*;
     use crate::tensor::{Distribution, TensorData};
     use crate::{TestBackend, module::Param, nn::LinearRecord};
+    use burn_tensor::{Tolerance, ops::FloatElem};
+    type FT = FloatElem<TestBackend>;
 
     fn init_gru<B: Backend>(reset_after: bool, device: &B::Device) -> Gru<B> {
         fn create_gate_controller<B: Backend>(
@@ -331,7 +333,10 @@ mod tests {
             .select(0, Tensor::arange(0..1, &device))
             .squeeze::<2>(0);
 
-        output.to_data().assert_approx_eq(&expected, 3);
+        let tolerance = Tolerance::default();
+        output
+            .to_data()
+            .assert_approx_eq::<FT>(&expected, tolerance);
 
         // Reset gate applied to hidden state after the matrix multiplication
         gru.reset_after = true; // override forward behavior
@@ -341,7 +346,9 @@ mod tests {
             .select(0, Tensor::arange(0..1, &device))
             .squeeze::<2>(0);
 
-        output.to_data().assert_approx_eq(&expected, 3);
+        output
+            .to_data()
+            .assert_approx_eq::<FT>(&expected, tolerance);
     }
 
     #[test]
@@ -359,7 +366,10 @@ mod tests {
             .select(0, Tensor::arange(0..1, &device))
             .squeeze::<2>(0);
 
-        output.to_data().assert_approx_eq(&expected, 3);
+        let tolerance = Tolerance::default();
+        output
+            .to_data()
+            .assert_approx_eq::<FT>(&expected, tolerance);
 
         // Reset gate applied to hidden state before the matrix multiplication
         gru.reset_after = false; // override forward behavior
@@ -369,7 +379,9 @@ mod tests {
             .select(0, Tensor::arange(0..1, &device))
             .squeeze::<2>(0);
 
-        output.to_data().assert_approx_eq(&expected, 3);
+        output
+            .to_data()
+            .assert_approx_eq::<FT>(&expected, tolerance);
     }
 
     #[test]
@@ -391,7 +403,7 @@ mod tests {
         let layer = config.init::<TestBackend>(&Default::default());
 
         assert_eq!(
-            alloc::format!("{}", layer),
+            alloc::format!("{layer}"),
             "Gru {d_input: 2, d_hidden: 8, bias: true, reset_after: true, params: 288}"
         );
     }

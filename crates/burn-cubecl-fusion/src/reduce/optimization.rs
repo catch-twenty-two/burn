@@ -1,11 +1,15 @@
 use std::sync::Arc;
 
 use burn_fusion::stream::Context;
-use burn_ir::{ReduceDimOpIr, TensorStatus};
+use burn_ir::ReduceDimOpIr;
 use burn_tensor::DType;
+use cubecl::ir::Elem;
 use cubecl::prelude::*;
 use cubecl::reduce::instructions::{ReduceFn, ReduceFnConfig};
-use cubecl::reduce::{BoundChecksInner, ReduceFamily, ReduceParams, ReduceStrategy, reduce_kernel};
+use cubecl::reduce::{
+    BoundChecksInner, ReduceFamily, ReduceParams, ReduceStrategy, init_tensors,
+    reduce_kernel_virtual,
+};
 use cubecl::{
     CubeCount, CubeDim, Runtime,
     client::ComputeClient,
@@ -13,30 +17,42 @@ use cubecl::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::CubeFusionHandle;
 use crate::elemwise::optimization::ElemwiseRunner;
-use crate::shared::ir::RefLayout;
+use crate::reduce::args::FusedReduceArgs;
+use crate::shared::ir::{FusePrecision, RefLayout};
 use crate::shared::trace::{TraceError, TraceRunner};
 use crate::shared::trace::{TuneOutput, Vectorization};
 use crate::shared::{
     ir::{Arg, FuseBlockConfig, GlobalArgsLaunch},
     trace::FuseTrace,
 };
+use crate::{CubeFusionHandle, FallbackOperation};
 
-use super::args::{FusedReduceArgs, FusedReduceInputLaunch, FusedReduceOutputLaunch};
+use super::args::{
+    FusedReduceInput, FusedReduceInputLaunch, FusedReduceOutput, FusedReduceOutputLaunch,
+};
 use super::tune::fused_reduce_autotune;
 
 pub struct ReduceOptimization<R: Runtime> {
+    info: Arc<ReduceOptimizationInfo<R>>,
+}
+
+pub(crate) struct ReduceOptimizationInfo<R: Runtime> {
     pub(crate) trace: FuseTrace,
     trace_read_fallback: FuseTrace,
     trace_write_fallback: FuseTrace,
     pub(crate) client: ComputeClient<R::Server, R::Channel>,
     pub(crate) device: R::Device,
     pub(crate) len: usize,
+    pub(crate) len_read: usize,
     pub(crate) reduce: FusedReduce,
     pub(crate) reduce_plane: FusedReduce,
     pub(crate) reduce_shared_plane: FusedReduce,
-    fallback: Arc<dyn ReduceFallbackFn<R>>,
+}
+
+pub(crate) struct ReduceOptimizationTuneArg<R: Runtime> {
+    pub(crate) info: Arc<ReduceOptimizationInfo<R>>,
+    pub(crate) fallback: Box<dyn FallbackOperation<R>>,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize, Debug)]
@@ -48,20 +64,14 @@ pub enum ReduceInstruction {
     Sum,
     Max,
     Min,
+    MaxAbs,
 }
 
 pub trait ReduceFallbackFn<R: Runtime>: Send + Sync {
-    fn run(
-        &self,
-        input_handle: CubeFusionHandle<R>,
-        shape: &[usize],
-        axis: usize,
-        inst: &ReduceInstruction,
-        dtype_out: &DType,
-    ) -> CubeFusionHandle<R>;
+    fn run(&self, context: &mut Context<'_, CubeFusionHandle<R>>);
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize)]
 pub struct ReduceOptimizationState {
     trace: FuseTrace,
     trace_read_fallback: FuseTrace,
@@ -70,12 +80,23 @@ pub struct ReduceOptimizationState {
     pub(crate) reduce_plane: FusedReduce,
     pub(crate) reduce_shared_plane: FusedReduce,
     len: usize,
+    len_read: usize,
+}
+
+impl core::fmt::Debug for ReduceOptimizationState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!(
+            "{{ len_read: {}, len_total: {} }}",
+            self.len_read, self.len
+        ))
+    }
 }
 
 #[derive(new, Clone, Serialize, Deserialize, Debug)]
 pub struct FusedReduce {
     input: Arg,
     output: Arg,
+    pub(crate) acc: FusePrecision,
     pub(crate) axis: usize,
     pub(crate) op: ReduceDimOpIr,
     strategy: ReduceStrategy,
@@ -87,6 +108,7 @@ impl FusedReduce {
         Self {
             input: self.input.clone(),
             output: self.output.clone(),
+            acc: self.acc,
             axis: self.axis,
             op: self.op.clone(),
             strategy,
@@ -102,6 +124,92 @@ pub enum FusedReduceError {
     InvalidInput,
 }
 
+impl<R: Runtime> ReduceOptimizationTuneArg<R> {
+    pub fn execute_fused_reduce<BT: CubeElement>(
+        &self,
+        context: &mut Context<'_, CubeFusionHandle<R>>,
+    ) -> Result<TuneOutput<R>, TraceError<FusedReduceError>> {
+        FuseTrace::run::<R, BT, FusedReduce>(
+            &self.info.trace,
+            &self.info.client,
+            &self.info.device,
+            context,
+            &self.info.reduce,
+        )
+    }
+
+    pub fn execute_fused_reduce_plane<BT: CubeElement>(
+        &self,
+        context: &mut Context<'_, CubeFusionHandle<R>>,
+    ) -> Result<TuneOutput<R>, TraceError<FusedReduceError>> {
+        FuseTrace::run::<R, BT, FusedReduce>(
+            &self.info.trace,
+            &self.info.client,
+            &self.info.device,
+            context,
+            &self.info.reduce_plane,
+        )
+    }
+
+    pub fn execute_fused_reduce_shared_plane<BT: CubeElement>(
+        &self,
+        context: &mut Context<'_, CubeFusionHandle<R>>,
+    ) -> Result<TuneOutput<R>, TraceError<FusedReduceError>> {
+        FuseTrace::run::<R, BT, FusedReduce>(
+            &self.info.trace,
+            &self.info.client,
+            &self.info.device,
+            context,
+            &self.info.reduce_shared_plane,
+        )
+    }
+
+    pub fn execute_fallback<BT: CubeElement>(
+        &self,
+        context: &mut Context<'_, CubeFusionHandle<R>>,
+    ) -> TuneOutput<R> {
+        #[allow(unused_mut)] // It is used when `autotune-checks` is activated.
+        let mut output_read = self
+            .info
+            .trace_read_fallback
+            .run::<R, BT, ElemwiseRunner>(
+                &self.info.client,
+                &self.info.device,
+                context,
+                &ElemwiseRunner,
+            )
+            .unwrap();
+
+        self.fallback.run(context);
+
+        #[cfg(feature = "autotune-checks")]
+        if let TuneOutput::Checked { handles } = &mut output_read {
+            let out_desc = context.tensors.get(&self.info.reduce.op.out.id).unwrap();
+            let handle_out = context
+                .handles
+                .get_handle(&out_desc.id, &burn_ir::TensorStatus::ReadOnly);
+
+            handles.insert(
+                self.info.reduce.op.out.id,
+                (out_desc.shape.clone(), handle_out.clone()),
+            );
+        }
+
+        let output_write = self
+            .info
+            .trace_write_fallback
+            .run::<R, BT, ElemwiseRunner>(
+                &self.info.client,
+                &self.info.device,
+                context,
+                &ElemwiseRunner,
+            )
+            .unwrap();
+
+        output_read.merge(output_write)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 impl<R: Runtime> ReduceOptimization<R> {
     pub fn new(
@@ -111,8 +219,8 @@ impl<R: Runtime> ReduceOptimization<R> {
         client: ComputeClient<R::Server, R::Channel>,
         device: R::Device,
         len: usize,
+        len_read: usize,
         reduce: FusedReduce,
-        fallback: Arc<dyn ReduceFallbackFn<R>>,
     ) -> Self {
         let reduce_plane = reduce.with_strategy(ReduceStrategy {
             use_planes: true,
@@ -122,155 +230,87 @@ impl<R: Runtime> ReduceOptimization<R> {
             use_planes: true,
             shared: true,
         });
-        Self {
+
+        let info = ReduceOptimizationInfo {
             trace,
             trace_read_fallback,
             trace_write_fallback,
             client,
             device,
             len,
+            len_read,
             reduce,
             reduce_plane,
             reduce_shared_plane,
-            fallback,
+        };
+
+        Self {
+            info: Arc::new(info),
         }
     }
     /// Execute the optimization.
-    pub fn execute<BT: CubeElement>(&mut self, context: &mut Context<'_, CubeFusionHandle<R>>) {
+    pub fn execute<BT: CubeElement>(
+        &mut self,
+        context: &mut Context<'_, CubeFusionHandle<R>>,
+        fallback: impl FnOnce(usize) -> Box<dyn FallbackOperation<R>>,
+    ) {
+        // The index of the fallback reduce is the number of ops fused as read.
+        let fallback = fallback(self.info.len_read);
+        let arg = ReduceOptimizationTuneArg {
+            info: self.info.clone(),
+            fallback,
+        };
+
         #[cfg(feature = "autotune")]
-        fused_reduce_autotune::<R, BT>(self, context);
+        fused_reduce_autotune::<R, BT>(arg, context);
 
         #[cfg(not(feature = "autotune"))]
-        if self.execute_fused_reduce::<BT>(context).is_err() {
-            self.execute_fallback::<BT>(context);
+        if arg.execute_fused_reduce::<BT>(context).is_err() {
+            arg.execute_fallback::<BT>(context);
         }
     }
 
     pub fn num_output_buffers(&self) -> usize {
-        self.trace_read_fallback.resources.outputs.len()
+        self.info.trace_read_fallback.resources.outputs.len()
     }
 
     pub fn to_state(&self) -> ReduceOptimizationState {
         ReduceOptimizationState {
-            trace: self.trace.clone(),
-            trace_read_fallback: self.trace_read_fallback.clone(),
-            trace_write_fallback: self.trace_write_fallback.clone(),
-            reduce: self.reduce.clone(),
-            reduce_plane: self.reduce_plane.clone(),
-            reduce_shared_plane: self.reduce_shared_plane.clone(),
-            len: self.len,
+            trace: self.info.trace.clone(),
+            trace_read_fallback: self.info.trace_read_fallback.clone(),
+            trace_write_fallback: self.info.trace_write_fallback.clone(),
+            reduce: self.info.reduce.clone(),
+            reduce_plane: self.info.reduce_plane.clone(),
+            reduce_shared_plane: self.info.reduce_shared_plane.clone(),
+            len: self.info.len,
+            len_read: self.info.len_read,
         }
     }
 
-    pub fn from_state(
-        device: &R::Device,
-        state: ReduceOptimizationState,
-        fallback: Arc<dyn ReduceFallbackFn<R>>,
-    ) -> Self {
+    pub fn from_state(device: &R::Device, state: ReduceOptimizationState) -> Self {
         let client = R::client(device);
 
-        Self {
+        let info = ReduceOptimizationInfo {
             trace: state.trace,
             trace_read_fallback: state.trace_read_fallback,
             trace_write_fallback: state.trace_write_fallback,
             reduce: state.reduce,
             reduce_plane: state.reduce_plane,
             reduce_shared_plane: state.reduce_shared_plane,
-            fallback,
             len: state.len,
+            len_read: state.len_read,
             client,
             device: device.clone(),
-        }
-    }
-
-    pub fn execute_fused_reduce<BT: CubeElement>(
-        &self,
-        context: &mut Context<'_, CubeFusionHandle<R>>,
-    ) -> Result<TuneOutput<R>, TraceError<FusedReduceError>> {
-        FuseTrace::run::<R, BT, FusedReduce>(
-            &self.trace,
-            &self.client,
-            &self.device,
-            context,
-            &self.reduce,
-        )
-    }
-
-    pub fn execute_fused_reduce_plane<BT: CubeElement>(
-        &self,
-        context: &mut Context<'_, CubeFusionHandle<R>>,
-    ) -> Result<TuneOutput<R>, TraceError<FusedReduceError>> {
-        FuseTrace::run::<R, BT, FusedReduce>(
-            &self.trace,
-            &self.client,
-            &self.device,
-            context,
-            &self.reduce_plane,
-        )
-    }
-
-    pub fn execute_fused_reduce_shared_plane<BT: CubeElement>(
-        &self,
-        context: &mut Context<'_, CubeFusionHandle<R>>,
-    ) -> Result<TuneOutput<R>, TraceError<FusedReduceError>> {
-        FuseTrace::run::<R, BT, FusedReduce>(
-            &self.trace,
-            &self.client,
-            &self.device,
-            context,
-            &self.reduce_shared_plane,
-        )
-    }
-
-    pub fn execute_fallback<BT: CubeElement>(
-        &self,
-        context: &mut Context<'_, CubeFusionHandle<R>>,
-    ) -> TuneOutput<R> {
-        #[allow(unused_mut)] // It is used when #[cfg(test)] is true.
-        let mut output_read = self
-            .trace_read_fallback
-            .run::<R, BT, ElemwiseRunner>(&self.client, &self.device, context, &ElemwiseRunner)
-            .unwrap();
-
-        let (out_tensor, out_desc) = {
-            let input = context
-                .tensors
-                .get(&self.reduce.op.input.id)
-                .unwrap()
-                .clone();
-            let out = context.tensors.get(&self.reduce.op.out.id).unwrap().clone();
-
-            let input_handle = context
-                .handles
-                .get_handle(&input.id, &TensorStatus::ReadOnly);
-            let out_handle = self.fallback.run(
-                input_handle,
-                &input.shape,
-                self.reduce.op.axis,
-                &self.reduce.inst,
-                &self.reduce.op.out.dtype,
-            );
-
-            (out_handle, out)
         };
-        #[cfg(feature = "autotune-checks")]
-        if let TuneOutput::Checked { handles } = &mut output_read {
-            handles.insert(
-                self.reduce.op.out.id,
-                (out_desc.shape.clone(), out_tensor.clone()),
-            );
-        }
-        context.handles.register_handle(out_desc.id, out_tensor);
-        let output_write = self
-            .trace_write_fallback
-            .run::<R, BT, ElemwiseRunner>(&self.client, &self.device, context, &ElemwiseRunner)
-            .unwrap();
 
-        output_read.merge(output_write)
+        Self {
+            info: Arc::new(info),
+        }
     }
+
     /// Returns the number of output buffers added by fusion.
     pub fn num_ops_fused(&self) -> usize {
-        self.len
+        self.info.len
     }
 }
 
@@ -298,7 +338,6 @@ impl<R: Runtime> TraceRunner<R> for FusedReduce {
             }
             _ => inputs.shape_ref(&config_read.ref_layout, config_read.rank as usize),
         };
-
         let reduce_count: u32 = shape
             .iter()
             .enumerate()
@@ -306,7 +345,7 @@ impl<R: Runtime> TraceRunner<R> for FusedReduce {
             .product();
 
         let line_mode = match self.axis == config_read.rank as usize - 1 {
-            true => LineMode::Parallel, // axis de vectorization == axis de reduce.
+            true => LineMode::Parallel,
             false => LineMode::Perpendicular,
         };
 
@@ -347,11 +386,12 @@ impl<R: Runtime> TraceRunner<R> for FusedReduce {
             input: &self.input,
             output: &self.output,
         };
-        launch_reduce_input_output_inst::<R>(
+        launch_reduce_mixed_precision::<R>(
             kwargs,
             self.inst,
             self.op.input.dtype,
             self.op.out.dtype,
+            DType::from(self.acc.into_elem()),
         );
 
         Ok(())
@@ -371,11 +411,12 @@ struct ReduceKwArgs<'a, 'b, Run: Runtime> {
     output: &'a Arg,
 }
 
-fn launch_reduce_input_output_inst<Run: Runtime>(
+fn launch_reduce_mixed_precision<Run: Runtime>(
     kwargs: ReduceKwArgs<'_, '_, Run>,
     instruction: ReduceInstruction,
     dtype_input: DType,
     dtype_output: DType,
+    dtype_acc: DType,
 ) {
     let config = match instruction {
         ReduceInstruction::ArgMax => ReduceFnConfig::ArgMax,
@@ -385,58 +426,17 @@ fn launch_reduce_input_output_inst<Run: Runtime>(
         ReduceInstruction::Sum => ReduceFnConfig::Sum,
         ReduceInstruction::Max => ReduceFnConfig::Max,
         ReduceInstruction::Min => ReduceFnConfig::Min,
+        ReduceInstruction::MaxAbs => ReduceFnConfig::MaxAbs,
     };
-    launch_reduce_input_output::<Run, ReduceFn>(kwargs, dtype_input, dtype_output, config)
+    launch_reduce::<Run, ReduceFn>(kwargs, config, dtype_input, dtype_output, dtype_acc)
 }
 
-fn launch_reduce_input_output<Run: Runtime, Rd: ReduceFamily>(
+fn launch_reduce<Run: Runtime, Rd: ReduceFamily>(
     kwargs: ReduceKwArgs<'_, '_, Run>,
+    config: Rd::Config,
     dtype_input: DType,
     dtype_output: DType,
-    config: Rd::Config,
-) {
-    match dtype_input {
-        DType::F64 => launch_reduce_output::<Run, f64, Rd>(kwargs, dtype_output, config),
-        DType::F32 => launch_reduce_output::<Run, f32, Rd>(kwargs, dtype_output, config),
-        DType::F16 => launch_reduce_output::<Run, half::f16, Rd>(kwargs, dtype_output, config),
-        DType::BF16 => launch_reduce_output::<Run, half::bf16, Rd>(kwargs, dtype_output, config),
-        DType::I64 => launch_reduce_output::<Run, i64, Rd>(kwargs, dtype_output, config),
-        DType::I32 => launch_reduce_output::<Run, i32, Rd>(kwargs, dtype_output, config),
-        DType::I16 => launch_reduce_output::<Run, i16, Rd>(kwargs, dtype_output, config),
-        DType::I8 => launch_reduce_output::<Run, i8, Rd>(kwargs, dtype_output, config),
-        DType::U64 => launch_reduce_output::<Run, u64, Rd>(kwargs, dtype_output, config),
-        DType::U32 => launch_reduce_output::<Run, u32, Rd>(kwargs, dtype_output, config),
-        DType::U16 => launch_reduce_output::<Run, u16, Rd>(kwargs, dtype_output, config),
-        DType::U8 => launch_reduce_output::<Run, u8, Rd>(kwargs, dtype_output, config),
-        _ => panic!("Unsupported"),
-    }
-}
-
-fn launch_reduce_output<Run: Runtime, In: Numeric, Rd: ReduceFamily>(
-    kwargs: ReduceKwArgs<'_, '_, Run>,
-    dtype: DType,
-    config: Rd::Config,
-) {
-    match dtype {
-        DType::F64 => launch_reduce::<Run, In, f64, Rd>(kwargs, config),
-        DType::F32 => launch_reduce::<Run, In, f32, Rd>(kwargs, config),
-        DType::F16 => launch_reduce::<Run, In, half::f16, Rd>(kwargs, config),
-        DType::BF16 => launch_reduce::<Run, In, half::bf16, Rd>(kwargs, config),
-        DType::I64 => launch_reduce::<Run, In, i64, Rd>(kwargs, config),
-        DType::I32 => launch_reduce::<Run, In, i32, Rd>(kwargs, config),
-        DType::I16 => launch_reduce::<Run, In, i16, Rd>(kwargs, config),
-        DType::I8 => launch_reduce::<Run, In, i8, Rd>(kwargs, config),
-        DType::U64 => launch_reduce::<Run, In, u64, Rd>(kwargs, config),
-        DType::U32 => launch_reduce::<Run, In, u32, Rd>(kwargs, config),
-        DType::U16 => launch_reduce::<Run, In, u16, Rd>(kwargs, config),
-        DType::U8 => launch_reduce::<Run, In, u8, Rd>(kwargs, config),
-        _ => panic!("Unsupported"),
-    }
-}
-
-fn launch_reduce<Run: Runtime, In: Numeric, Out: Numeric, Rd: ReduceFamily>(
-    kwargs: ReduceKwArgs<'_, '_, Run>,
-    config: Rd::Config,
+    dtype_acc: DType,
 ) {
     let settings = ReduceParams {
         shared: kwargs.strategy.shared.then(|| {
@@ -455,7 +455,7 @@ fn launch_reduce<Run: Runtime, In: Numeric, Out: Numeric, Rd: ReduceFamily>(
     };
 
     unsafe {
-        reduce_kernel::launch_unchecked::<In, Out, Rd, FusedReduceArgs, Run>(
+        reduce_kernel::launch_unchecked::<Rd, Run>(
             kwargs.client,
             kwargs.config_reduce.cube_count,
             kwargs.config_reduce.cube_dim,
@@ -464,6 +464,40 @@ fn launch_reduce<Run: Runtime, In: Numeric, Out: Numeric, Rd: ReduceFamily>(
             ScalarArg::new(kwargs.axis),
             settings,
             config,
+            dtype_input.into(),
+            dtype_output.into(),
+            dtype_acc.into(),
         );
     }
+}
+
+const INPUT: u8 = 0;
+const OUTPUT: u8 = 1;
+const ACC: u8 = 2;
+
+#[cube(launch_unchecked)]
+pub fn reduce_kernel<R: ReduceFamily>(
+    input: &FusedReduceInput,
+    output: &mut FusedReduceOutput,
+    axis_reduce: u32,
+    #[comptime] params: ReduceParams,
+    #[comptime] config: R::Config,
+    #[comptime] elem_in: Elem,
+    #[comptime] elem_out: Elem,
+    #[comptime] elem_acc: Elem,
+) {
+    set_polyfill::<NumericExpand<INPUT>>(elem_in);
+    set_polyfill::<NumericExpand<OUTPUT>>(elem_out);
+    set_polyfill::<NumericExpand<ACC>>(elem_acc);
+
+    let (input, mut output) =
+        init_tensors::<FusedReduceArgs, NumericExpand<INPUT>, NumericExpand<OUTPUT>>(input, output);
+
+    reduce_kernel_virtual::<NumericExpand<INPUT>, NumericExpand<OUTPUT>, NumericExpand<ACC>, R>(
+        &input,
+        &mut output,
+        axis_reduce,
+        params,
+        config,
+    );
 }

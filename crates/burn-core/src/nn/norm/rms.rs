@@ -71,8 +71,7 @@ impl<B: Backend> RmsNorm<B> {
     pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
         // Calculate the root-mean-square norm of the input tensor along the last dimension
         let dtype = x.dtype();
-        let rms =
-            (x.clone().cast(DType::F32).powf_scalar(2.0).mean_dim(D - 1) + self.epsilon).sqrt();
+        let rms = (x.clone().cast(DType::F32).powi_scalar(2).mean_dim(D - 1) + self.epsilon).sqrt();
         (x / rms.cast(dtype)) * self.gamma.val().unsqueeze()
     }
 }
@@ -99,6 +98,8 @@ mod tests {
     use crate::TestBackend;
     use crate::tensor::TensorData;
     use alloc::format;
+    use burn_tensor::{Tolerance, ops::FloatElem};
+    type FT = FloatElem<TestBackend>;
 
     #[test]
     fn rms_norm_forward() {
@@ -116,7 +117,9 @@ mod tests {
             [0.7348, 0.9798, 1.2247],
             [0.8514, 0.9933, 1.1352],
         ]);
-        output.to_data().assert_approx_eq(&expected, 4);
+        output
+            .to_data()
+            .assert_approx_eq::<FT>(&expected, Tolerance::default());
     }
 
     #[test]
@@ -125,7 +128,7 @@ mod tests {
         let layer_norm = config.init::<TestBackend>(&Default::default());
 
         assert_eq!(
-            format!("{}", layer_norm),
+            format!("{layer_norm}"),
             "RmsNorm {d_model: 6, epsilon: 0.00001, params: 6}"
         );
     }

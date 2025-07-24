@@ -1,6 +1,7 @@
 use super::{Node, NodeCodegen};
 use crate::burn::{Scope, TensorType, ToTokens, Type};
 use burn::record::PrecisionSettings;
+use onnx_ir::node::expand::ExpandShape;
 use proc_macro2::TokenStream;
 use quote::quote;
 
@@ -9,12 +10,6 @@ pub struct ExpandNode {
     pub input: TensorType,
     pub output: TensorType,
     pub shape: ExpandShape,
-}
-
-#[derive(Debug, Clone)]
-pub enum ExpandShape {
-    Static(Vec<i64>),
-    Runtime(Type),
 }
 
 impl<PS: PrecisionSettings> NodeCodegen<PS> for ExpandNode {
@@ -28,33 +23,30 @@ impl<PS: PrecisionSettings> NodeCodegen<PS> for ExpandNode {
         // if it is dynamic, the shape will be our 2nd:
         match &self.shape {
             ExpandShape::Static(_) => vec![input],
-            ExpandShape::Runtime(rt_type) => vec![input, rt_type.clone()],
+            ExpandShape::Runtime(rt_type) => vec![input, Type::from(rt_type)],
         }
     }
-
     fn forward(&self, scope: &mut Scope, node_position: usize) -> TokenStream {
         let input = scope.tensor_use_owned(&self.input, node_position);
         let output = &self.output.name;
+        let output_rank = &self.output.rank;
 
         let shape = match &self.shape {
             ExpandShape::Static(static_shape) => static_shape.to_tokens(),
-            ExpandShape::Runtime(Type::Tensor(shape_tensor)) => {
-                // since we don't take ownership of the shape_tensor, we don't need `tensor_use_owned` here:
-                let tensor_name = &shape_tensor.name;
-                let dim = shape_tensor.shape.as_ref().unwrap()[0];
-                // the shape of the tensor is already validated statically to be rank one when parsing the input
-                // we'll need to download the Tensor from device to cpu for expand operation.
-                // Also, we'll need to convert it to an array for conversion into BroadcastArgs
-                quote! {
-                    TryInto::<[B::IntElem; #dim]>::try_into(#tensor_name.to_data().as_slice::<B::IntElem>().unwrap()).unwrap()
+            ExpandShape::Runtime(ty) => match Type::from(ty) {
+                Type::Tensor(shape_tensor) => {
+                    let tensor_name = &shape_tensor.name;
+                    quote! {
+                        TryInto::<[B::IntElem; #output_rank]>::try_into(#tensor_name.to_data().as_slice::<B::IntElem>().unwrap()).unwrap()
+                    }
                 }
-            }
-            ExpandShape::Runtime(Type::Shape(shape)) => {
-                // Shape implements BroadcastArgs, so it can be passed to expand directly
-                let shape_name = &shape.name;
-                quote! { #shape_name }
-            }
-            _ => panic!("Invalid shape source {:?}", self.shape),
+                Type::Shape(shape) => {
+                    // Shape implements BroadcastArgs, allowing it to be passed directly to the expand method.
+                    let shape_name = &shape.name;
+                    quote! { #shape_name }
+                }
+                b => panic!("Invalid shape source {b:?}"),
+            },
         };
 
         quote! {
@@ -70,10 +62,11 @@ impl<PS: PrecisionSettings> NodeCodegen<PS> for ExpandNode {
 #[cfg(test)]
 mod tests {
     use burn::record::FullPrecisionSettings;
+    use onnx_ir::{ArgType, Argument, ElementType};
 
     use super::*;
     use crate::burn::{
-        ShapeType, TensorType,
+        TensorType,
         graph::BurnGraph,
         node::{expand::ExpandNode, test::assert_tokens},
     };
@@ -121,7 +114,6 @@ mod tests {
 
         assert_tokens(graph.codegen(), expected);
     }
-
     #[test]
     fn test_codegen_expand_shape() {
         let mut graph = BurnGraph::<FullPrecisionSettings>::default();
@@ -129,7 +121,12 @@ mod tests {
         graph.register(ExpandNode::new(
             TensorType::new_float("tensor1", 4),
             TensorType::new_float("tensor2", 4),
-            ExpandShape::Runtime(Type::Shape(ShapeType::new("shape1", 4))),
+            ExpandShape::Runtime(Argument {
+                name: "shape1".to_string(),
+                ty: ArgType::Shape(4),
+                value: None,
+                passed: false,
+            }),
         ));
 
         graph.register_input_output(
@@ -177,13 +174,19 @@ mod tests {
     fn test_codegen_expand_tensor() {
         let mut graph = BurnGraph::<FullPrecisionSettings>::default();
 
-        let mut shape_tensor_type = TensorType::new_int("tensor3", 4);
-        shape_tensor_type.shape = Some(vec![4]);
-
         graph.register(ExpandNode::new(
             TensorType::new_float("tensor1", 4),
             TensorType::new_float("tensor2", 4),
-            ExpandShape::Runtime(Type::Tensor(shape_tensor_type)),
+            ExpandShape::Runtime(Argument {
+                name: "tensor3".to_string(),
+                ty: ArgType::Tensor(onnx_ir::TensorType {
+                    elem_type: ElementType::Int32,
+                    rank: 1,
+                    static_shape: None,
+                }),
+                value: None,
+                passed: false,
+            }),
         ));
 
         graph.register_input_output(
@@ -216,7 +219,7 @@ mod tests {
                 pub fn forward(
                     &self,
                     tensor1: Tensor<B, 4>,
-                    tensor3: Tensor<B, 4, Int>,
+                    tensor3: Tensor<B, 1, Int>,
                 ) -> Tensor<B, 4> {
                     let tensor2 = tensor1.expand(
                         TryInto::<[B::IntElem; 4usize]>::try_into(tensor3.to_data().as_slice::<B::IntElem>().unwrap())

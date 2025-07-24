@@ -76,7 +76,9 @@ where
 mod fusion {
     use super::*;
     use burn_fusion::{
-        Fusion, FusionBackend, FusionRuntime, client::FusionClient, stream::Operation,
+        Fusion, FusionBackend, FusionRuntime,
+        client::FusionClient,
+        stream::{Operation, OperationStreams},
     };
     use burn_ir::{CustomOpIr, HandleContainer, OperationIr};
 
@@ -86,7 +88,7 @@ mod fusion {
             let width = img.shape[1];
             let client = img.client.clone();
 
-            #[derive(derive_new::new)]
+            #[derive(derive_new::new, Clone, Debug)]
             struct ConnComp<B> {
                 desc: CustomOpIr,
                 conn: Connectivity,
@@ -95,26 +97,27 @@ mod fusion {
 
             impl<B1: FusionBackend + BoolVisionOps> Operation<B1::FusionRuntime> for ConnComp<B1> {
                 fn execute(
-                    self: Box<Self>,
+                    &self,
                     handles: &mut HandleContainer<
                         <B1::FusionRuntime as FusionRuntime>::FusionHandle,
                     >,
                 ) {
-                    let ([img], [labels]) = self.desc.consume();
-                    let input = handles.get_bool_tensor::<B1>(&img);
+                    let ([img], [labels]) = self.desc.as_fixed();
+                    let input = handles.get_bool_tensor::<B1>(img);
                     let output = B1::connected_components(input, self.conn);
 
                     handles.register_int_tensor::<B1>(&labels.id, output);
                 }
             }
 
-            let stream = img.stream;
+            let mut streams = OperationStreams::default();
+            streams.tensor(&img);
             let out = client.tensor_uninitialized(vec![height, width], B::IntElem::dtype());
 
             let desc =
                 CustomOpIr::new("connected_components", &[img.into_ir()], &[out.to_ir_out()]);
             client.register(
-                vec![stream],
+                streams,
                 OperationIr::Custom(desc.clone()),
                 ConnComp::<B>::new(desc, conn),
             );
@@ -131,7 +134,7 @@ mod fusion {
             let width = img.shape[1];
             let client = img.client.clone();
 
-            #[derive(derive_new::new)]
+            #[derive(derive_new::new, Clone, Debug)]
             struct ConnCompStats<B> {
                 desc: CustomOpIr,
                 conn: Connectivity,
@@ -141,14 +144,14 @@ mod fusion {
 
             impl<B1: FusionBackend + BoolVisionOps> Operation<B1::FusionRuntime> for ConnCompStats<B1> {
                 fn execute(
-                    self: Box<Self>,
+                    &self,
                     handles: &mut HandleContainer<
                         <B1::FusionRuntime as FusionRuntime>::FusionHandle,
                     >,
                 ) {
                     let ([img], [labels, area, left, top, right, bottom, max_label]) =
-                        self.desc.consume();
-                    let input = handles.get_bool_tensor::<B1>(&img);
+                        self.desc.as_fixed();
+                    let input = handles.get_bool_tensor::<B1>(img);
                     let (output, stats) =
                         B1::connected_components_with_stats(input, self.conn, self.opts);
 
@@ -162,7 +165,8 @@ mod fusion {
                 }
             }
 
-            let stream = img.stream;
+            let mut streams = OperationStreams::default();
+            streams.tensor(&img);
             let out = client.tensor_uninitialized(vec![height, width], B::IntElem::dtype());
             let area = client.tensor_uninitialized(vec![height * width], B::IntElem::dtype());
             let left = client.tensor_uninitialized(vec![height * width], B::IntElem::dtype());
@@ -185,7 +189,7 @@ mod fusion {
                 ],
             );
             client.register(
-                vec![stream],
+                streams,
                 OperationIr::Custom(desc.clone()),
                 ConnCompStats::<B>::new(desc, conn, opts),
             );

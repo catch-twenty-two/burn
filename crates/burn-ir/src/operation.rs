@@ -11,19 +11,19 @@ use burn_tensor::{
     ops::{
         ConvOptions, ConvTransposeOptions, DeformConvOptions, InterpolateMode, InterpolateOptions,
     },
-    quantization::QuantizationScheme,
+    quantization::QuantScheme,
 };
 
-use crate::TensorIr;
+use crate::{TensorId, TensorIr, TensorStatus};
 
-/// Custom operation in fusion stream, declaring it's inputs and outputs.
+/// Custom operation in fusion stream, declaring its inputs and outputs.
 #[derive(Clone, Debug, Hash, PartialEq, Serialize, Deserialize)]
 pub struct CustomOpIr {
     /// Unique identifier of the operation.
     pub id: String,
-    /// Input tensors used in this the custom operation.
+    /// Input tensors used in the custom operation.
     pub inputs: Vec<TensorIr>,
-    /// Output tensors used in this the custom operation.
+    /// Output tensors used in the custom operation.
     pub outputs: Vec<TensorIr>,
 }
 
@@ -37,15 +37,15 @@ impl CustomOpIr {
         }
     }
 
-    /// Consume the intermediate representation, and get the in and output tensors.
-    pub fn consume<const N_IN: usize, const N_OUT: usize>(
-        self,
-    ) -> ([TensorIr; N_IN], [TensorIr; N_OUT]) {
+    /// Cast the intermediate representation, and get the in and output tensors.
+    pub fn as_fixed<const N_IN: usize, const N_OUT: usize>(
+        &self,
+    ) -> (&[TensorIr; N_IN], &[TensorIr; N_OUT]) {
         (
-            self.inputs.try_into().expect(
+            self.inputs.as_slice().try_into().expect(
                 "Wrong number of inputs expected (expected {D}, is {}), check your implementation",
             ),
-            self.outputs.try_into().expect(
+            self.outputs.as_slice().try_into().expect(
                 "Wrong number of outputs expected (expected {D}, is {}), check your implementation",
             ),
         )
@@ -81,6 +81,8 @@ pub enum OperationIr {
     Init(InitOperationIr),
     /// A custom operation.
     Custom(CustomOpIr),
+    /// A tensor is dropped.
+    Drop(TensorIr),
 }
 
 /// Operation intermediate representation specific to a float tensor.
@@ -500,6 +502,16 @@ pub enum NumericOperationIr<E> {
     MinDim(ReduceDimOpIr),
     /// Operation corresponding to:
     ///
+    /// Float => [max_abs](burn_tensor::ops::FloatTensorOps::float_max_abs).
+    /// Int => [max_abs](burn_tensor::ops::IntTensorOps::int_max_abs).
+    MaxAbs(UnaryOpIr),
+    /// Operation corresponding to:
+    ///
+    /// Float => [max_abs dim](burn_tensor::ops::FloatTensorOps::float_max_abs_dim).
+    /// Int => [max_abs dim](burn_tensor::ops::IntTensorOps::int_max_abs_dim).
+    MaxAbsDim(ReduceDimOpIr),
+    /// Operation corresponding to:
+    ///
     /// Float => [clamp](burn_tensor::ops::FloatTensorOps::float_clamp).
     /// Int => [clamp](burn_tensor::ops::IntTensorOps::int_clamp).
     Clamp(ClampOpIr<E>),
@@ -661,6 +673,8 @@ pub struct UnaryOpIr {
 #[allow(missing_docs)]
 pub struct ScalarOpIr<E> {
     pub lhs: TensorIr,
+    // TODO: Make that an enum with `Value` and `Id` variants for relative/global
+    // conversion.
     pub rhs: E,
     pub out: TensorIr,
 }
@@ -958,9 +972,7 @@ pub struct ConvTranspose3dOptionsIr {
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuantizationParametersIr {
     /// The scaling factor.
-    pub scale: TensorIr,
-    /// The zero-point offset.
-    pub offset: Option<TensorIr>,
+    pub scales: TensorIr,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Serialize, Deserialize)]
@@ -968,7 +980,7 @@ pub struct QuantizationParametersIr {
 pub struct QuantizeOpIr {
     pub tensor: TensorIr,
     pub qparams: QuantizationParametersIr,
-    pub scheme: QuantizationScheme,
+    pub scheme: QuantScheme,
     pub out: TensorIr,
 }
 
@@ -1361,7 +1373,7 @@ pub struct InterpolateBackwardOpIr {
 }
 
 impl OperationIr {
-    /// Cleanup the remaining tensor handles that have not been used.
+    /// Get all [tensor](TensorIr) involved with the current operation.
     pub fn nodes(&self) -> Vec<&TensorIr> {
         match self {
             OperationIr::BaseFloat(repr) => repr.nodes(),
@@ -1375,6 +1387,40 @@ impl OperationIr {
             OperationIr::Module(repr) => repr.nodes(),
             OperationIr::Init(repr) => repr.nodes(),
             OperationIr::Custom(repr) => repr.nodes(),
+            OperationIr::Drop(repr) => vec![repr],
+        }
+    }
+
+    /// Set the given nodes that are [read write](super::TensorStatus::ReadWrite) to
+    /// [read only](super::TensorStatus::ReadOnly) in the current operation.
+    ///
+    /// Returns the tensor that were updated with their original representation.
+    pub fn mark_read_only(&mut self, nodes: &[TensorId]) -> Vec<TensorIr> {
+        match self {
+            OperationIr::BaseFloat(repr) => repr.mark_read_only(nodes),
+            OperationIr::BaseInt(repr) => repr.mark_read_only(nodes),
+            OperationIr::BaseBool(repr) => repr.mark_read_only(nodes),
+            OperationIr::NumericFloat(_dtype, repr) => repr.mark_read_only(nodes),
+            OperationIr::NumericInt(_dtype, repr) => repr.mark_read_only(nodes),
+            OperationIr::Bool(repr) => repr.mark_read_only(nodes),
+            OperationIr::Int(repr) => repr.mark_read_only(nodes),
+            OperationIr::Float(_dtype, repr) => repr.mark_read_only(nodes),
+            OperationIr::Module(repr) => repr.mark_read_only(nodes),
+            OperationIr::Init(_) => Vec::new(),
+            OperationIr::Drop(repr) => {
+                let mut output = Vec::new();
+                repr.mark_read_only(nodes, &mut output);
+                output
+            }
+            OperationIr::Custom(repr) => {
+                let mut output = Vec::new();
+
+                for input in repr.inputs.iter_mut() {
+                    input.mark_read_only(nodes, &mut output);
+                }
+
+                output
+            }
         }
     }
 }
@@ -1412,10 +1458,66 @@ impl BaseOperationIr {
             BaseOperationIr::RepeatDim(repr) => {
                 vec![&repr.tensor, &repr.out]
             }
-            BaseOperationIr::Cat(repr) => repr.tensors.iter().collect(),
+            BaseOperationIr::Cat(repr) => {
+                let mut tensors: Vec<_> = repr.tensors.iter().collect();
+                tensors.push(&repr.out);
+                tensors
+            }
             BaseOperationIr::Cast(repr) => vec![&repr.input, &repr.out],
             BaseOperationIr::Empty(repr) => vec![repr],
         }
+    }
+
+    fn mark_read_only(&mut self, nodes: &[TensorId]) -> Vec<TensorIr> {
+        let mut output = Vec::new();
+
+        match self {
+            BaseOperationIr::ToDevice(repr) => {
+                repr.mark_read_only(nodes, &mut output);
+            }
+            BaseOperationIr::Reshape(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            BaseOperationIr::SwapDims(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            BaseOperationIr::Permute(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+
+            BaseOperationIr::Expand(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+
+            BaseOperationIr::Flip(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            BaseOperationIr::Slice(repr) => {
+                repr.tensor.mark_read_only(nodes, &mut output);
+            }
+            BaseOperationIr::SliceAssign(repr) => {
+                repr.tensor.mark_read_only(nodes, &mut output);
+                repr.value.mark_read_only(nodes, &mut output);
+            }
+            BaseOperationIr::Equal(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+                repr.rhs.mark_read_only(nodes, &mut output);
+            }
+            BaseOperationIr::RepeatDim(repr) => {
+                repr.tensor.mark_read_only(nodes, &mut output);
+            }
+            BaseOperationIr::Cat(repr) => {
+                for t in repr.tensors.iter_mut() {
+                    t.mark_read_only(nodes, &mut output);
+                }
+            }
+            BaseOperationIr::Cast(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            BaseOperationIr::Empty(_) => {}
+        };
+
+        output
     }
 }
 
@@ -1548,6 +1650,12 @@ impl<E: Element> NumericOperationIr<E> {
             NumericOperationIr::MinDim(repr) => {
                 vec![&repr.input, &repr.out]
             }
+            NumericOperationIr::MaxAbs(repr) => {
+                vec![&repr.input, &repr.out]
+            }
+            NumericOperationIr::MaxAbsDim(repr) => {
+                vec![&repr.input, &repr.out]
+            }
             NumericOperationIr::IntRandom(repr) => {
                 vec![&repr.out]
             }
@@ -1555,6 +1663,169 @@ impl<E: Element> NumericOperationIr<E> {
                 vec![&repr.lhs, &repr.rhs, &repr.out]
             }
         }
+    }
+    fn mark_read_only(&mut self, nodes: &[TensorId]) -> Vec<TensorIr> {
+        let mut output = Vec::new();
+
+        match self {
+            NumericOperationIr::Add(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+                repr.rhs.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::AddScalar(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::Sub(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+                repr.rhs.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::SubScalar(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::Mul(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+                repr.rhs.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::MulScalar(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::Div(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+                repr.rhs.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::DivScalar(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::Rem(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+                repr.rhs.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::RemScalar(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::Ones(_) => {}
+            NumericOperationIr::Gather(repr) => {
+                repr.tensor.mark_read_only(nodes, &mut output);
+                repr.indices.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::Scatter(repr) => {
+                repr.tensor.mark_read_only(nodes, &mut output);
+                repr.indices.mark_read_only(nodes, &mut output);
+                repr.value.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::Select(repr) => {
+                repr.tensor.mark_read_only(nodes, &mut output);
+                repr.indices.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::SelectAssign(repr) => {
+                repr.tensor.mark_read_only(nodes, &mut output);
+                repr.indices.mark_read_only(nodes, &mut output);
+                repr.value.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::MaskWhere(repr) => {
+                repr.tensor.mark_read_only(nodes, &mut output);
+                repr.mask.mark_read_only(nodes, &mut output);
+                repr.value.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::MaskFill(repr) => {
+                repr.tensor.mark_read_only(nodes, &mut output);
+                repr.mask.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::EqualElem(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::GreaterElem(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::GreaterEqualElem(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::LowerElem(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::LowerEqualElem(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::Greater(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+                repr.rhs.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::GreaterEqual(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+                repr.rhs.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::Lower(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+                repr.rhs.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::LowerEqual(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+                repr.rhs.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::ArgMax(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::ArgMin(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::Clamp(repr) => {
+                repr.tensor.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::Abs(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::Zeros(_) => {}
+            NumericOperationIr::Full(_) => {}
+            NumericOperationIr::MeanDim(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::Mean(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::Sum(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::SumDim(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::Prod(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::ProdDim(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::Max(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::MaxDimWithIndices(repr) => {
+                repr.tensor.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::MinDimWithIndices(repr) => {
+                repr.tensor.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::Min(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::MaxDim(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::MinDim(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::MaxAbs(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::MaxAbsDim(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            NumericOperationIr::IntRandom(_) => {}
+            NumericOperationIr::Powf(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+                repr.rhs.mark_read_only(nodes, &mut output);
+            }
+        };
+
+        output
     }
 }
 
@@ -1579,15 +1850,72 @@ impl FloatOperationIr {
             FloatOperationIr::Floor(repr) => vec![&repr.input, &repr.out],
             FloatOperationIr::Ceil(repr) => vec![&repr.input, &repr.out],
             FloatOperationIr::IntoInt(repr) => vec![&repr.input, &repr.out],
-            FloatOperationIr::Quantize(repr) => {
-                if let Some(offset) = &repr.qparams.offset {
-                    vec![&repr.tensor, &repr.qparams.scale, &offset, &repr.out]
-                } else {
-                    vec![&repr.tensor, &repr.qparams.scale, &repr.out]
-                }
-            }
+            FloatOperationIr::Quantize(repr) => vec![&repr.tensor, &repr.qparams.scales, &repr.out],
             FloatOperationIr::Dequantize(repr) => vec![&repr.input, &repr.out],
         }
+    }
+
+    fn mark_read_only(&mut self, nodes: &[TensorId]) -> Vec<TensorIr> {
+        let mut output = Vec::new();
+
+        match self {
+            FloatOperationIr::Matmul(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+                repr.rhs.mark_read_only(nodes, &mut output);
+            }
+            FloatOperationIr::Random(_) => {}
+            FloatOperationIr::Exp(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            FloatOperationIr::Log(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            FloatOperationIr::Log1p(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            FloatOperationIr::Erf(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            FloatOperationIr::Recip(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            FloatOperationIr::PowfScalar(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+            }
+            FloatOperationIr::Sqrt(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            FloatOperationIr::Cos(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            FloatOperationIr::Sin(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            FloatOperationIr::Tanh(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            FloatOperationIr::Round(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            FloatOperationIr::Floor(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            FloatOperationIr::Ceil(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            FloatOperationIr::Quantize(repr) => {
+                repr.tensor.mark_read_only(nodes, &mut output);
+                repr.qparams.scales.mark_read_only(nodes, &mut output);
+            }
+            FloatOperationIr::Dequantize(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            FloatOperationIr::IntoInt(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+        };
+
+        output
     }
 }
 
@@ -1630,6 +1958,56 @@ impl IntOperationIr {
             }
         }
     }
+
+    fn mark_read_only(&mut self, nodes: &[TensorId]) -> Vec<TensorIr> {
+        let mut output = Vec::new();
+
+        match self {
+            IntOperationIr::IntoFloat(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            IntOperationIr::BitwiseAnd(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+                repr.rhs.mark_read_only(nodes, &mut output);
+            }
+            IntOperationIr::BitwiseAndScalar(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+            }
+            IntOperationIr::BitwiseOr(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+                repr.rhs.mark_read_only(nodes, &mut output);
+            }
+            IntOperationIr::BitwiseOrScalar(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+            }
+            IntOperationIr::BitwiseXor(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+                repr.rhs.mark_read_only(nodes, &mut output);
+            }
+            IntOperationIr::BitwiseXorScalar(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+            }
+            IntOperationIr::BitwiseNot(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            IntOperationIr::BitwiseLeftShift(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+                repr.rhs.mark_read_only(nodes, &mut output);
+            }
+            IntOperationIr::BitwiseLeftShiftScalar(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+            }
+            IntOperationIr::BitwiseRightShift(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+                repr.rhs.mark_read_only(nodes, &mut output);
+            }
+            IntOperationIr::BitwiseRightShiftScalar(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+            }
+        };
+
+        output
+    }
 }
 
 impl BoolOperationIr {
@@ -1641,6 +2019,31 @@ impl BoolOperationIr {
             BoolOperationIr::And(repr) => vec![&repr.lhs, &repr.rhs, &repr.out],
             BoolOperationIr::Or(repr) => vec![&repr.lhs, &repr.rhs, &repr.out],
         }
+    }
+    fn mark_read_only(&mut self, nodes: &[TensorId]) -> Vec<TensorIr> {
+        let mut output = Vec::new();
+
+        match self {
+            BoolOperationIr::IntoFloat(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            BoolOperationIr::IntoInt(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            BoolOperationIr::Not(repr) => {
+                repr.input.mark_read_only(nodes, &mut output);
+            }
+            BoolOperationIr::And(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+                repr.rhs.mark_read_only(nodes, &mut output);
+            }
+            BoolOperationIr::Or(repr) => {
+                repr.lhs.mark_read_only(nodes, &mut output);
+                repr.rhs.mark_read_only(nodes, &mut output);
+            }
+        };
+
+        output
     }
 }
 
@@ -1680,14 +2083,22 @@ impl ModuleOperationIr {
                 (None, Some(bias)) => vec![&repr.x, &repr.offset, &repr.weight, &bias],
                 (None, None) => vec![&repr.x, &repr.offset, &repr.weight],
             },
-            ModuleOperationIr::DeformableConv2dBackward(repr) => match (&repr.mask, &repr.bias) {
-                (Some(mask), Some(bias)) => {
-                    vec![&repr.x, &repr.offset, &repr.weight, &mask, &bias]
+            ModuleOperationIr::DeformableConv2dBackward(repr) => {
+                let mut nodes = Vec::with_capacity(6);
+                nodes.push(&repr.x);
+                nodes.push(&repr.offset);
+                nodes.push(&repr.weight);
+                nodes.push(&repr.out_grad);
+
+                if let Some(mask) = repr.mask.as_ref() {
+                    nodes.push(mask);
                 }
-                (Some(mask), None) => vec![&repr.x, &repr.offset, &repr.weight, &mask],
-                (None, Some(bias)) => vec![&repr.x, &repr.offset, &repr.weight, &bias],
-                (None, None) => vec![&repr.x, &repr.offset, &repr.weight],
-            },
+                if let Some(bias) = repr.bias.as_ref() {
+                    nodes.push(bias);
+                }
+
+                nodes
+            }
             ModuleOperationIr::ConvTranspose1d(repr) => {
                 if let Some(bias) = &repr.bias {
                     vec![&repr.x, &repr.weight, &bias, &repr.out]
@@ -1759,6 +2170,159 @@ impl ModuleOperationIr {
             }
         }
     }
+
+    fn mark_read_only(&mut self, nodes: &[TensorId]) -> Vec<TensorIr> {
+        let mut output = Vec::new();
+
+        match self {
+            ModuleOperationIr::Embedding(repr) => {
+                repr.weights.mark_read_only(nodes, &mut output);
+                repr.indices.mark_read_only(nodes, &mut output);
+            }
+            ModuleOperationIr::EmbeddingBackward(repr) => {
+                repr.weights.mark_read_only(nodes, &mut output);
+                repr.out_grad.mark_read_only(nodes, &mut output);
+                repr.indices.mark_read_only(nodes, &mut output);
+            }
+            ModuleOperationIr::Conv1d(repr) => {
+                repr.x.mark_read_only(nodes, &mut output);
+                repr.weight.mark_read_only(nodes, &mut output);
+
+                if let Some(bias) = &mut repr.bias {
+                    bias.mark_read_only(nodes, &mut output);
+                }
+            }
+            ModuleOperationIr::Conv2d(repr) => {
+                repr.x.mark_read_only(nodes, &mut output);
+                repr.weight.mark_read_only(nodes, &mut output);
+
+                if let Some(bias) = &mut repr.bias {
+                    bias.mark_read_only(nodes, &mut output);
+                }
+            }
+            ModuleOperationIr::Conv3d(repr) => {
+                repr.x.mark_read_only(nodes, &mut output);
+                repr.weight.mark_read_only(nodes, &mut output);
+
+                if let Some(bias) = &mut repr.bias {
+                    bias.mark_read_only(nodes, &mut output);
+                }
+            }
+            ModuleOperationIr::DeformableConv2d(repr) => {
+                repr.x.mark_read_only(nodes, &mut output);
+                repr.weight.mark_read_only(nodes, &mut output);
+                repr.offset.mark_read_only(nodes, &mut output);
+
+                match (&mut repr.mask, &mut repr.bias) {
+                    (Some(mask), Some(bias)) => {
+                        mask.mark_read_only(nodes, &mut output);
+                        bias.mark_read_only(nodes, &mut output);
+                    }
+                    (Some(mask), None) => {
+                        mask.mark_read_only(nodes, &mut output);
+                    }
+                    (None, Some(bias)) => {
+                        bias.mark_read_only(nodes, &mut output);
+                    }
+                    (None, None) => {}
+                };
+            }
+            ModuleOperationIr::DeformableConv2dBackward(repr) => {
+                repr.x.mark_read_only(nodes, &mut output);
+                repr.weight.mark_read_only(nodes, &mut output);
+                repr.offset.mark_read_only(nodes, &mut output);
+                repr.out_grad.mark_read_only(nodes, &mut output);
+
+                if let Some(mask) = repr.mask.as_mut() {
+                    mask.mark_read_only(nodes, &mut output);
+                }
+                if let Some(bias) = repr.bias.as_mut() {
+                    bias.mark_read_only(nodes, &mut output);
+                }
+            }
+            ModuleOperationIr::ConvTranspose1d(repr) => {
+                repr.x.mark_read_only(nodes, &mut output);
+                repr.weight.mark_read_only(nodes, &mut output);
+
+                if let Some(bias) = &mut repr.bias {
+                    bias.mark_read_only(nodes, &mut output);
+                }
+            }
+            ModuleOperationIr::ConvTranspose2d(repr) => {
+                repr.x.mark_read_only(nodes, &mut output);
+                repr.weight.mark_read_only(nodes, &mut output);
+
+                if let Some(bias) = &mut repr.bias {
+                    bias.mark_read_only(nodes, &mut output);
+                }
+            }
+            ModuleOperationIr::ConvTranspose3d(repr) => {
+                repr.x.mark_read_only(nodes, &mut output);
+                repr.weight.mark_read_only(nodes, &mut output);
+
+                if let Some(bias) = &mut repr.bias {
+                    bias.mark_read_only(nodes, &mut output);
+                }
+            }
+            ModuleOperationIr::AvgPool1d(repr) => {
+                repr.x.mark_read_only(nodes, &mut output);
+            }
+            ModuleOperationIr::AvgPool2d(repr) => {
+                repr.x.mark_read_only(nodes, &mut output);
+            }
+            ModuleOperationIr::AvgPool1dBackward(repr) => {
+                repr.x.mark_read_only(nodes, &mut output);
+                repr.grad.mark_read_only(nodes, &mut output);
+            }
+            ModuleOperationIr::AvgPool2dBackward(repr) => {
+                repr.x.mark_read_only(nodes, &mut output);
+                repr.grad.mark_read_only(nodes, &mut output);
+            }
+            ModuleOperationIr::AdaptiveAvgPool1d(repr) => {
+                repr.x.mark_read_only(nodes, &mut output);
+            }
+            ModuleOperationIr::AdaptiveAvgPool2d(repr) => {
+                repr.x.mark_read_only(nodes, &mut output);
+            }
+            ModuleOperationIr::AdaptiveAvgPool1dBackward(repr) => {
+                repr.x.mark_read_only(nodes, &mut output);
+                repr.grad.mark_read_only(nodes, &mut output);
+            }
+            ModuleOperationIr::AdaptiveAvgPool2dBackward(repr) => {
+                repr.x.mark_read_only(nodes, &mut output);
+                repr.grad.mark_read_only(nodes, &mut output);
+            }
+            ModuleOperationIr::MaxPool1d(repr) => {
+                repr.x.mark_read_only(nodes, &mut output);
+            }
+            ModuleOperationIr::MaxPool1dWithIndices(repr) => {
+                repr.x.mark_read_only(nodes, &mut output);
+            }
+            ModuleOperationIr::MaxPool1dWithIndicesBackward(repr) => {
+                repr.x.mark_read_only(nodes, &mut output);
+                repr.grad.mark_read_only(nodes, &mut output);
+            }
+            ModuleOperationIr::MaxPool2d(repr) => {
+                repr.x.mark_read_only(nodes, &mut output);
+            }
+            ModuleOperationIr::MaxPool2dWithIndices(repr) => {
+                repr.x.mark_read_only(nodes, &mut output);
+            }
+            ModuleOperationIr::MaxPool2dWithIndicesBackward(repr) => {
+                repr.x.mark_read_only(nodes, &mut output);
+                repr.grad.mark_read_only(nodes, &mut output);
+            }
+            ModuleOperationIr::Interpolate(repr) => {
+                repr.x.mark_read_only(nodes, &mut output);
+            }
+            ModuleOperationIr::InterpolateBackward(repr) => {
+                repr.x.mark_read_only(nodes, &mut output);
+                repr.grad.mark_read_only(nodes, &mut output);
+            }
+        };
+
+        output
+    }
 }
 
 impl core::hash::Hash for InitOperationIr {
@@ -1770,6 +2334,15 @@ impl core::hash::Hash for InitOperationIr {
 impl InitOperationIr {
     fn nodes(&self) -> Vec<&TensorIr> {
         vec![&self.out]
+    }
+}
+
+impl TensorIr {
+    fn mark_read_only(&mut self, nodes: &[TensorId], output: &mut Vec<TensorIr>) {
+        if self.status == TensorStatus::ReadWrite && nodes.contains(&self.id) {
+            output.push(self.clone());
+            self.status = TensorStatus::ReadOnly;
+        }
     }
 }
 
@@ -1854,6 +2427,8 @@ impl<E> core::hash::Hash for NumericOperationIr<E> {
             NumericOperationIr::Min(repr) => repr.hash(state),
             NumericOperationIr::MaxDim(repr) => repr.hash(state),
             NumericOperationIr::MinDim(repr) => repr.hash(state),
+            NumericOperationIr::MaxAbs(repr) => repr.hash(state),
+            NumericOperationIr::MaxAbsDim(repr) => repr.hash(state),
             NumericOperationIr::Clamp(repr) => repr.hash(state),
             NumericOperationIr::IntRandom(repr) => repr.hash(state),
             NumericOperationIr::Powf(repr) => repr.hash(state),

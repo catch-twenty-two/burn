@@ -1,4 +1,8 @@
-use crate::{Fusion, FusionBackend, client::FusionClient, stream::execution::Operation};
+use crate::{
+    Fusion, FusionBackend,
+    client::FusionClient,
+    stream::{OperationStreams, execution::Operation},
+};
 use burn_ir::*;
 use burn_tensor::{
     Element,
@@ -16,16 +20,16 @@ use std::marker::PhantomData;
 
 macro_rules! make_ops {
     ($name:ident, $desc:ty, $fn:expr) => {
-        #[derive(new)]
+        #[derive(new, Debug)]
         struct $name<B: FusionBackend> {
             desc: $desc,
             _b: PhantomData<B>,
         }
 
         impl<B: FusionBackend> Operation<B::FusionRuntime> for $name<B> {
-            fn execute(self: Box<Self>, handles: &mut HandleContainer<B::Handle>) {
+            fn execute(&self, handles: &mut HandleContainer<B::Handle>) {
                 #[allow(clippy::redundant_closure_call)]
-                $fn(self.desc, handles)
+                $fn(&self.desc, handles)
             }
         }
     };
@@ -38,7 +42,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         bias: Option<FloatTensor<Self>>,
         options: ConvOptions<1>,
     ) -> FloatTensor<Self> {
-        make_ops!(Conv1dOps, Conv1dOpIr, |desc: Conv1dOpIr,
+        make_ops!(Conv1dOps, Conv1dOpIr, |desc: &Conv1dOpIr,
                                           handles: &mut HandleContainer<
             B::Handle,
         >| {
@@ -48,7 +52,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
                 .bias
                 .as_ref()
                 .map(|bias| handles.get_float_tensor::<B>(bias));
-            let output = B::conv1d(x, weight, bias, desc.options.into());
+            let output = B::conv1d(x, weight, bias, desc.options.clone().into());
             handles.register_float_tensor::<B>(&desc.out.id, output);
         });
 
@@ -60,9 +64,14 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             x.shape[2],
         );
 
-        let stream_1 = x.stream;
-        let stream_2 = weight.stream;
-        let stream_3 = bias.as_ref().map(|b| b.stream);
+        let mut streams = OperationStreams::default();
+        streams.tensor(&x);
+        streams.tensor(&weight);
+
+        if let Some(bias) = bias.as_ref() {
+            streams.tensor(bias)
+        }
+
         let shape = vec![x.shape[0], weight.shape[0], size];
         let out = x.client.tensor_uninitialized(shape, B::FloatElem::dtype());
 
@@ -74,10 +83,6 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             out: out.to_ir_out(),
         };
 
-        let streams = match stream_3 {
-            Some(stream_3) => vec![stream_1, stream_2, stream_3],
-            None => vec![stream_1, stream_2],
-        };
         out.client.clone().register(
             streams,
             OperationIr::Module(ModuleOperationIr::Conv1d(description.clone())),
@@ -93,7 +98,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         bias: Option<FloatTensor<Self>>,
         options: ConvOptions<2>,
     ) -> FloatTensor<Self> {
-        make_ops!(Conv2dOps, Conv2dOpIr, |args: Conv2dOpIr,
+        make_ops!(Conv2dOps, Conv2dOpIr, |args: &Conv2dOpIr,
                                           handles: &mut HandleContainer<
             B::Handle,
         >| {
@@ -124,9 +129,13 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             x.shape[3],
         );
 
-        let stream_1 = x.stream;
-        let stream_2 = weight.stream;
-        let stream_3 = bias.as_ref().map(|b| b.stream);
+        let mut streams = OperationStreams::default();
+        streams.tensor(&x);
+        streams.tensor(&weight);
+
+        if let Some(bias) = bias.as_ref() {
+            streams.tensor(bias)
+        }
         let shape = vec![x.shape[0], weight.shape[0], size_0, size_1];
         let out = x.client.tensor_uninitialized(shape, B::FloatElem::dtype());
 
@@ -138,10 +147,6 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             out: out.to_ir_out(),
         };
 
-        let streams = match stream_3 {
-            Some(stream_3) => vec![stream_1, stream_2, stream_3],
-            None => vec![stream_1, stream_2],
-        };
         out.client.register(
             streams,
             OperationIr::Module(ModuleOperationIr::Conv2d(desc.clone())),
@@ -162,7 +167,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         make_ops!(
             DeformConv2dOps,
             DeformConv2dOpIr,
-            |args: DeformConv2dOpIr, handles: &mut HandleContainer<B::Handle>| {
+            |args: &DeformConv2dOpIr, handles: &mut HandleContainer<B::Handle>| {
                 let x = handles.get_float_tensor::<B>(&args.x);
                 let offset = handles.get_float_tensor::<B>(&args.offset);
                 let weight = handles.get_float_tensor::<B>(&args.weight);
@@ -197,11 +202,18 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             x.shape[3],
         );
 
-        let stream_1 = x.stream;
-        let stream_2 = offset.stream;
-        let stream_3 = weight.stream;
-        let stream_4 = mask.as_ref().map(|m| m.stream);
-        let stream_5 = bias.as_ref().map(|b| b.stream);
+        let mut streams = OperationStreams::default();
+        streams.tensor(&x);
+        streams.tensor(&offset);
+        streams.tensor(&weight);
+
+        if let Some(bias) = bias.as_ref() {
+            streams.tensor(bias)
+        }
+        if let Some(mask) = mask.as_ref() {
+            streams.tensor(mask)
+        }
+
         let shape = vec![x.shape[0], weight.shape[0], size_0, size_1];
         let out = x.client.tensor_uninitialized(shape, B::FloatElem::dtype());
 
@@ -215,18 +227,6 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             out: out.to_ir_out(),
         };
 
-        let streams = match (stream_4, stream_5) {
-            (Some(stream_4), Some(stream_5)) => {
-                vec![stream_1, stream_2, stream_3, stream_4, stream_5]
-            }
-            (Some(stream_4), None) => {
-                vec![stream_1, stream_2, stream_3, stream_4]
-            }
-            (None, Some(stream_5)) => {
-                vec![stream_1, stream_2, stream_3, stream_5]
-            }
-            (None, None) => vec![stream_1, stream_2, stream_3],
-        };
         out.client.register(
             streams,
             OperationIr::Module(ModuleOperationIr::DeformableConv2d(Box::new(desc.clone()))),
@@ -248,7 +248,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         make_ops!(
             DeformConv2dBackwardOps,
             DeformConv2dBackwardOpIr,
-            |args: DeformConv2dBackwardOpIr, handles: &mut HandleContainer<B::Handle>| {
+            |args: &DeformConv2dBackwardOpIr, handles: &mut HandleContainer<B::Handle>| {
                 let x = handles.get_float_tensor::<B>(&args.x);
                 let offset = handles.get_float_tensor::<B>(&args.offset);
                 let weight = handles.get_float_tensor::<B>(&args.weight);
@@ -304,12 +304,18 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
                 .tensor_uninitialized(bias.shape.clone(), B::FloatElem::dtype())
         });
 
-        let stream_1 = x.stream;
-        let stream_2 = offset.stream;
-        let stream_3 = weight.stream;
-        let stream_4 = mask.as_ref().map(|m| m.stream);
-        let stream_5 = bias.as_ref().map(|b| b.stream);
-        let stream_6 = output_grad.stream;
+        let mut streams = OperationStreams::default();
+        streams.tensor(&x);
+        streams.tensor(&offset);
+        streams.tensor(&weight);
+        streams.tensor(&output_grad);
+
+        if let Some(bias) = bias.as_ref() {
+            streams.tensor(bias)
+        }
+        if let Some(mask) = mask.as_ref() {
+            streams.tensor(mask)
+        }
 
         let desc = DeformConv2dBackwardOpIr {
             x: x.into_ir(),
@@ -324,19 +330,6 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             weight_grad: weight_grad.to_ir_out(),
             mask_grad: mask_grad.as_ref().map(|mask_grad| mask_grad.to_ir_out()),
             bias_grad: bias_grad.as_ref().map(|bias_grad| bias_grad.to_ir_out()),
-        };
-
-        let streams = match (stream_4, stream_5) {
-            (Some(stream_4), Some(stream_5)) => {
-                vec![stream_1, stream_2, stream_3, stream_4, stream_5, stream_6]
-            }
-            (Some(stream_4), None) => {
-                vec![stream_1, stream_2, stream_3, stream_4, stream_6]
-            }
-            (None, Some(stream_5)) => {
-                vec![stream_1, stream_2, stream_3, stream_5, stream_6]
-            }
-            (None, None) => vec![stream_1, stream_2, stream_3, stream_6],
         };
 
         input_grad.client.register(
@@ -356,7 +349,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         bias: Option<FloatTensor<Self>>,
         options: ConvOptions<3>,
     ) -> FloatTensor<Self> {
-        make_ops!(Conv3dOps, Conv3dOpIr, |args: Conv3dOpIr,
+        make_ops!(Conv3dOps, Conv3dOpIr, |args: &Conv3dOpIr,
                                           handles: &mut HandleContainer<
             B::Handle,
         >| {
@@ -394,9 +387,14 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             x.shape[4],
         );
 
-        let stream_1 = x.stream;
-        let stream_2 = weight.stream;
-        let stream_3 = bias.as_ref().map(|b| b.stream);
+        let mut streams = OperationStreams::default();
+        streams.tensor(&x);
+        streams.tensor(&weight);
+
+        if let Some(bias) = bias.as_ref() {
+            streams.tensor(bias)
+        }
+
         let shape = vec![x.shape[0], weight.shape[0], size_0, size_1, size_2];
         let out = x.client.tensor_uninitialized(shape, B::FloatElem::dtype());
 
@@ -408,10 +406,6 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             out: out.to_ir_out(),
         };
 
-        let streams = match stream_3 {
-            Some(stream_3) => vec![stream_1, stream_2, stream_3],
-            None => vec![stream_1, stream_2],
-        };
         out.client.register(
             streams,
             OperationIr::Module(ModuleOperationIr::Conv3d(desc.clone())),
@@ -430,7 +424,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         make_ops!(
             ConvTranspose1dOps,
             ConvTranspose1dOpIr,
-            |args: ConvTranspose1dOpIr, handles: &mut HandleContainer<B::Handle>| {
+            |args: &ConvTranspose1dOpIr, handles: &mut HandleContainer<B::Handle>| {
                 let x = handles.get_float_tensor::<B>(&args.x);
                 let weight = handles.get_float_tensor::<B>(&args.weight);
                 let bias = args
@@ -453,9 +447,14 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             x.shape[2],
         );
 
-        let stream_1 = x.stream;
-        let stream_2 = weight.stream;
-        let stream_3 = bias.as_ref().map(|b| b.stream);
+        let mut streams = OperationStreams::default();
+        streams.tensor(&x);
+        streams.tensor(&weight);
+
+        if let Some(bias) = bias.as_ref() {
+            streams.tensor(bias)
+        }
+
         let shape = vec![x.shape[0], weight.shape[1] * options.groups, size];
         let out = x.client.tensor_uninitialized(shape, B::FloatElem::dtype());
 
@@ -467,10 +466,6 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             out: out.to_ir_out(),
         };
 
-        let streams = match stream_3 {
-            Some(stream_3) => vec![stream_1, stream_2, stream_3],
-            None => vec![stream_1, stream_2],
-        };
         out.client.register(
             streams,
             OperationIr::Module(ModuleOperationIr::ConvTranspose1d(desc.clone())),
@@ -489,7 +484,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         make_ops!(
             ConvTranspose2dOps,
             ConvTranspose2dOpIr,
-            |args: ConvTranspose2dOpIr, handles: &mut HandleContainer<B::Handle>| {
+            |args: &ConvTranspose2dOpIr, handles: &mut HandleContainer<B::Handle>| {
                 let x = handles.get_float_tensor::<B>(&args.x);
                 let weight = handles.get_float_tensor::<B>(&args.weight);
                 let bias = args
@@ -520,9 +515,14 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             x.shape[3],
         );
 
-        let stream_1 = x.stream;
-        let stream_2 = weight.stream;
-        let stream_3 = bias.as_ref().map(|b| b.stream);
+        let mut streams = OperationStreams::default();
+        streams.tensor(&x);
+        streams.tensor(&weight);
+
+        if let Some(bias) = bias.as_ref() {
+            streams.tensor(bias)
+        }
+
         let shape = vec![x.shape[0], weight.shape[1] * options.groups, size_0, size_1];
         let out = x.client.tensor_uninitialized(shape, B::FloatElem::dtype());
 
@@ -534,10 +534,6 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             out: out.to_ir_out(),
         };
 
-        let streams = match stream_3 {
-            Some(stream_3) => vec![stream_1, stream_2, stream_3],
-            None => vec![stream_1, stream_2],
-        };
         out.client.register(
             streams,
             OperationIr::Module(ModuleOperationIr::ConvTranspose2d(desc.clone())),
@@ -556,7 +552,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         make_ops!(
             ConvTranspose3dOps,
             ConvTranspose3dOpIr,
-            |args: ConvTranspose3dOpIr, handles: &mut HandleContainer<B::Handle>| {
+            |args: &ConvTranspose3dOpIr, handles: &mut HandleContainer<B::Handle>| {
                 let x = handles.get_float_tensor::<B>(&args.x);
                 let weight = handles.get_float_tensor::<B>(&args.weight);
                 let bias = args
@@ -595,9 +591,14 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             x.shape[4],
         );
 
-        let stream_1 = x.stream;
-        let stream_2 = weight.stream;
-        let stream_3 = bias.as_ref().map(|b| b.stream);
+        let mut streams = OperationStreams::default();
+        streams.tensor(&x);
+        streams.tensor(&weight);
+
+        if let Some(bias) = bias.as_ref() {
+            streams.tensor(bias)
+        }
+
         let shape = vec![
             x.shape[0],
             weight.shape[1] * options.groups,
@@ -615,10 +616,6 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             out: out.to_ir_out(),
         };
 
-        let streams = match stream_3 {
-            Some(stream_3) => vec![stream_1, stream_2, stream_3],
-            None => vec![stream_1, stream_2],
-        };
         out.client.register(
             streams,
             OperationIr::Module(ModuleOperationIr::ConvTranspose3d(desc.clone())),
@@ -638,7 +635,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         make_ops!(
             AvgPool1dOps,
             AvgPool1dOpIr,
-            |args: AvgPool1dOpIr, handles: &mut HandleContainer<B::Handle>| {
+            |args: &AvgPool1dOpIr, handles: &mut HandleContainer<B::Handle>| {
                 let x = handles.get_float_tensor::<B>(&args.x);
                 let output = B::avg_pool1d(
                     x,
@@ -652,7 +649,9 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             }
         );
 
-        let stream = x.stream;
+        let mut streams = OperationStreams::default();
+        streams.tensor(&x);
+
         let size = calculate_pool_output_size(kernel_size, stride, padding, 1, x.shape[2]);
         let shape = vec![x.shape[0], x.shape[1], size];
         let out = x.client.tensor_uninitialized(shape, B::FloatElem::dtype());
@@ -666,7 +665,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             out: out.to_ir_out(),
         };
         out.client.register(
-            vec![stream],
+            streams,
             OperationIr::Module(ModuleOperationIr::AvgPool1d(desc.clone())),
             AvgPool1dOps::<B>::new(desc),
         );
@@ -684,7 +683,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         make_ops!(
             AvgPool2dOps,
             AvgPool2dOpIr,
-            |args: AvgPool2dOpIr, handles: &mut HandleContainer<B::Handle>| {
+            |args: &AvgPool2dOpIr, handles: &mut HandleContainer<B::Handle>| {
                 let x = handles.get_float_tensor::<B>(&args.x);
                 let output = B::avg_pool2d(
                     x,
@@ -703,7 +702,9 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         let size_1 =
             calculate_pool_output_size(kernel_size[1], stride[1], padding[1], 1, x.shape[3]);
 
-        let stream = x.stream;
+        let mut streams = OperationStreams::default();
+        streams.tensor(&x);
+
         let shape = vec![x.shape[0], x.shape[1], size_0, size_1];
         let out = x.client.tensor_uninitialized(shape, B::FloatElem::dtype());
 
@@ -716,7 +717,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             out: out.to_ir_out(),
         };
         out.client.register(
-            vec![stream],
+            streams,
             OperationIr::Module(ModuleOperationIr::AvgPool2d(desc.clone())),
             AvgPool2dOps::<B>::new(desc),
         );
@@ -735,7 +736,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         make_ops!(
             AvgPool1dBackwardOps,
             AvgPool1dBackwardOpIr,
-            |args: AvgPool1dBackwardOpIr, handles: &mut HandleContainer<B::Handle>| {
+            |args: &AvgPool1dBackwardOpIr, handles: &mut HandleContainer<B::Handle>| {
                 let x = handles.get_float_tensor::<B>(&args.x);
                 let grad = handles.get_float_tensor::<B>(&args.grad);
                 let output = B::avg_pool1d_backward(
@@ -751,8 +752,10 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             }
         );
 
-        let stream_1 = x.stream;
-        let stream_2 = grad.stream;
+        let mut streams = OperationStreams::default();
+        streams.tensor(&x);
+        streams.tensor(&grad);
+
         let out = x
             .client
             .tensor_uninitialized(x.shape.clone(), B::FloatElem::dtype());
@@ -767,7 +770,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             out: out.to_ir_out(),
         };
         out.client.register(
-            vec![stream_1, stream_2],
+            streams,
             OperationIr::Module(ModuleOperationIr::AvgPool1dBackward(desc.clone())),
             AvgPool1dBackwardOps::<B>::new(desc),
         );
@@ -786,7 +789,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         make_ops!(
             AvgPool2dBackwardOps,
             AvgPool2dBackwardOpIr,
-            |args: AvgPool2dBackwardOpIr, handles: &mut HandleContainer<B::Handle>| {
+            |args: &AvgPool2dBackwardOpIr, handles: &mut HandleContainer<B::Handle>| {
                 let x = handles.get_float_tensor::<B>(&args.x);
                 let grad = handles.get_float_tensor::<B>(&args.grad);
                 let output = B::avg_pool2d_backward(
@@ -802,8 +805,10 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             }
         );
 
-        let stream_1 = x.stream;
-        let stream_2 = grad.stream;
+        let mut streams = OperationStreams::default();
+        streams.tensor(&x);
+        streams.tensor(&grad);
+
         let out = x
             .client
             .tensor_uninitialized(x.shape.clone(), B::FloatElem::dtype());
@@ -818,7 +823,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             out: out.to_ir_out(),
         };
         out.client.register(
-            vec![stream_1, stream_2],
+            streams,
             OperationIr::Module(ModuleOperationIr::AvgPool2dBackward(desc.clone())),
             AvgPool2dBackwardOps::<B>::new(desc),
         );
@@ -836,7 +841,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         make_ops!(
             MaxPool1dOps,
             MaxPool1dOpIr,
-            |args: MaxPool1dOpIr, handles: &mut HandleContainer<B::Handle>| {
+            |args: &MaxPool1dOpIr, handles: &mut HandleContainer<B::Handle>| {
                 let x = handles.get_float_tensor::<B>(&args.x);
                 let output = B::max_pool1d(
                     x,
@@ -852,7 +857,9 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
 
         let size = calculate_pool_output_size(kernel_size, stride, padding, dilation, x.shape[2]);
 
-        let stream = x.stream;
+        let mut streams = OperationStreams::default();
+        streams.tensor(&x);
+
         let shape = vec![x.shape[0], x.shape[1], size];
         let out = x.client.tensor_uninitialized(shape, B::FloatElem::dtype());
 
@@ -865,7 +872,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             out: out.to_ir_out(),
         };
         out.client.register(
-            vec![stream],
+            streams,
             OperationIr::Module(ModuleOperationIr::MaxPool1d(desc.clone())),
             MaxPool1dOps::<B>::new(desc),
         );
@@ -883,7 +890,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         make_ops!(
             MaxPool2dOps,
             MaxPool2dOpIr,
-            |args: MaxPool2dOpIr, handles: &mut HandleContainer<B::Handle>| {
+            |args: &MaxPool2dOpIr, handles: &mut HandleContainer<B::Handle>| {
                 let x = handles.get_float_tensor::<B>(&args.x);
                 let output = B::max_pool2d(
                     x,
@@ -912,7 +919,9 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             x.shape[3],
         );
 
-        let stream = x.stream;
+        let mut streams = OperationStreams::default();
+        streams.tensor(&x);
+
         let shape = vec![x.shape[0], x.shape[1], size_0, size_1];
         let out = x.client.tensor_uninitialized(shape, B::FloatElem::dtype());
 
@@ -925,7 +934,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             out: out.to_ir_out(),
         };
         out.client.register(
-            vec![stream],
+            streams,
             OperationIr::Module(ModuleOperationIr::MaxPool2d(desc.clone())),
             MaxPool2dOps::<B>::new(desc),
         );
@@ -943,7 +952,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         make_ops!(
             MaxPool1dWithIndicesOps,
             MaxPool1dWithIndicesOpIr,
-            |args: MaxPool1dWithIndicesOpIr, handles: &mut HandleContainer<B::Handle>| {
+            |args: &MaxPool1dWithIndicesOpIr, handles: &mut HandleContainer<B::Handle>| {
                 let x = handles.get_float_tensor::<B>(&args.x);
                 let output = B::max_pool1d_with_indices(
                     x,
@@ -958,7 +967,9 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             }
         );
 
-        let stream = x.stream;
+        let mut streams = OperationStreams::default();
+        streams.tensor(&x);
+
         let size = calculate_pool_output_size(kernel_size, stride, padding, dilation, x.shape[2]);
         let shape = vec![x.shape[0], x.shape[1], size];
         let out = x
@@ -976,7 +987,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             out_indices: out_indices.to_ir_out(),
         };
         out.client.register(
-            vec![stream],
+            streams,
             OperationIr::Module(ModuleOperationIr::MaxPool1dWithIndices(desc.clone())),
             MaxPool1dWithIndicesOps::<B>::new(desc),
         );
@@ -994,7 +1005,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         make_ops!(
             MaxPool2dWithIndicesOps,
             MaxPool2dWithIndicesOpIr,
-            |args: MaxPool2dWithIndicesOpIr, handles: &mut HandleContainer<B::Handle>| {
+            |args: &MaxPool2dWithIndicesOpIr, handles: &mut HandleContainer<B::Handle>| {
                 let x = handles.get_float_tensor::<B>(&args.x);
                 let output = B::max_pool2d_with_indices(
                     x,
@@ -1024,7 +1035,9 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             x.shape[3],
         );
 
-        let stream = x.stream;
+        let mut streams = OperationStreams::default();
+        streams.tensor(&x);
+
         let shape = vec![x.shape[0], x.shape[1], size_0, size_1];
         let out = x
             .client
@@ -1041,7 +1054,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             out_indices: out_indices.to_ir_out(),
         };
         out.client.register(
-            vec![stream],
+            streams,
             OperationIr::Module(ModuleOperationIr::MaxPool2dWithIndices(desc.clone())),
             MaxPool2dWithIndicesOps::<B>::new(desc),
         );
@@ -1061,7 +1074,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         make_ops!(
             MaxPool1dWithIndicesBackwardOps,
             MaxPool1dWithIndicesBackwardOpIr,
-            |args: MaxPool1dWithIndicesBackwardOpIr, handles: &mut HandleContainer<B::Handle>| {
+            |args: &MaxPool1dWithIndicesBackwardOpIr, handles: &mut HandleContainer<B::Handle>| {
                 let x = handles.get_float_tensor::<B>(&args.x);
                 let grad = handles.get_float_tensor::<B>(&args.grad);
                 let indices = handles.get_int_tensor::<B>(&args.indices);
@@ -1079,9 +1092,11 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             }
         );
 
-        let stream_1 = x.stream;
-        let stream_2 = output_grad.stream;
-        let stream_3 = indices.stream;
+        let mut streams = OperationStreams::default();
+        streams.tensor(&x);
+        streams.tensor(&output_grad);
+        streams.tensor(&indices);
+
         let out = x
             .client
             .tensor_uninitialized(x.shape.clone(), B::FloatElem::dtype());
@@ -1097,7 +1112,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             out: out.to_ir_out(),
         };
         out.client.register(
-            vec![stream_1, stream_2, stream_3],
+            streams,
             OperationIr::Module(ModuleOperationIr::MaxPool1dWithIndicesBackward(
                 desc.clone(),
             )),
@@ -1119,7 +1134,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         make_ops!(
             MaxPool2dWithIndicesBackwardOps,
             MaxPool2dWithIndicesBackwardOpIr,
-            |args: MaxPool2dWithIndicesBackwardOpIr, handles: &mut HandleContainer<B::Handle>| {
+            |args: &MaxPool2dWithIndicesBackwardOpIr, handles: &mut HandleContainer<B::Handle>| {
                 let x = handles.get_float_tensor::<B>(&args.x);
                 let grad = handles.get_float_tensor::<B>(&args.grad);
                 let indices = handles.get_int_tensor::<B>(&args.indices);
@@ -1137,9 +1152,11 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             }
         );
 
-        let stream_1 = x.stream;
-        let stream_2 = output_grad.stream;
-        let stream_3 = indices.stream;
+        let mut streams = OperationStreams::default();
+        streams.tensor(&x);
+        streams.tensor(&output_grad);
+        streams.tensor(&indices);
+
         let out = x
             .client
             .tensor_uninitialized(x.shape.clone(), B::FloatElem::dtype());
@@ -1155,7 +1172,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             out: out.to_ir_out(),
         };
         out.client.register(
-            vec![stream_1, stream_2, stream_3],
+            streams,
             OperationIr::Module(ModuleOperationIr::MaxPool2dWithIndicesBackward(
                 desc.clone(),
             )),
@@ -1169,7 +1186,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         make_ops!(
             AdaptiveAvgPool1dOps,
             AdaptiveAvgPool1dOpIr,
-            |args: AdaptiveAvgPool1dOpIr, handles: &mut HandleContainer<B::Handle>| {
+            |args: &AdaptiveAvgPool1dOpIr, handles: &mut HandleContainer<B::Handle>| {
                 let x = handles.get_float_tensor::<B>(&args.x);
                 let output = B::adaptive_avg_pool1d(x, args.output_size);
 
@@ -1177,7 +1194,9 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             }
         );
 
-        let stream = x.stream;
+        let mut streams = OperationStreams::default();
+        streams.tensor(&x);
+
         let shape = vec![x.shape[0], x.shape[1], output_size];
         let out = x.client.tensor_uninitialized(shape, B::FloatElem::dtype());
 
@@ -1187,7 +1206,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             out: out.to_ir_out(),
         };
         out.client.register(
-            vec![stream],
+            streams,
             OperationIr::Module(ModuleOperationIr::AdaptiveAvgPool1d(desc.clone())),
             AdaptiveAvgPool1dOps::<B>::new(desc),
         );
@@ -1199,7 +1218,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         make_ops!(
             AdaptiveAvgPool2dOps,
             AdaptiveAvgPool2dOpIr,
-            |args: AdaptiveAvgPool2dOpIr, handles: &mut HandleContainer<B::Handle>| {
+            |args: &AdaptiveAvgPool2dOpIr, handles: &mut HandleContainer<B::Handle>| {
                 let x = handles.get_float_tensor::<B>(&args.x);
                 let output = B::adaptive_avg_pool2d(x, args.output_size);
 
@@ -1207,7 +1226,9 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             }
         );
 
-        let stream = x.stream;
+        let mut streams = OperationStreams::default();
+        streams.tensor(&x);
+
         let shape = vec![x.shape[0], x.shape[1], output_size[0], output_size[1]];
         let out = x.client.tensor_uninitialized(shape, B::FloatElem::dtype());
 
@@ -1217,7 +1238,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             out: out.to_ir_out(),
         };
         out.client.register(
-            vec![stream],
+            streams,
             OperationIr::Module(ModuleOperationIr::AdaptiveAvgPool2d(desc.clone())),
             AdaptiveAvgPool2dOps::<B>::new(desc),
         );
@@ -1232,7 +1253,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         make_ops!(
             AdaptiveAvgPool1dBackwardOps,
             AdaptiveAvgPool1dBackwardOpIr,
-            |args: AdaptiveAvgPool1dBackwardOpIr, handles: &mut HandleContainer<B::Handle>| {
+            |args: &AdaptiveAvgPool1dBackwardOpIr, handles: &mut HandleContainer<B::Handle>| {
                 let x = handles.get_float_tensor::<B>(&args.x);
                 let grad = handles.get_float_tensor::<B>(&args.grad);
                 let output = B::adaptive_avg_pool1d_backward(x, grad);
@@ -1241,8 +1262,10 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             }
         );
 
-        let stream_1 = x.stream;
-        let stream_2 = grad.stream;
+        let mut streams = OperationStreams::default();
+        streams.tensor(&x);
+        streams.tensor(&grad);
+
         let out = x
             .client
             .tensor_uninitialized(x.shape.clone(), B::FloatElem::dtype());
@@ -1253,7 +1276,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         };
 
         out.client.register(
-            vec![stream_1, stream_2],
+            streams,
             OperationIr::Module(ModuleOperationIr::AdaptiveAvgPool1dBackward(desc.clone())),
             AdaptiveAvgPool1dBackwardOps::<B>::new(desc),
         );
@@ -1268,7 +1291,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         make_ops!(
             AdaptiveAvgPool2dBackwardOps,
             AdaptiveAvgPool2dBackwardOpIr,
-            |args: AdaptiveAvgPool2dBackwardOpIr, handles: &mut HandleContainer<B::Handle>| {
+            |args: &AdaptiveAvgPool2dBackwardOpIr, handles: &mut HandleContainer<B::Handle>| {
                 let x = handles.get_float_tensor::<B>(&args.x);
                 let grad = handles.get_float_tensor::<B>(&args.grad);
                 let output = B::adaptive_avg_pool2d_backward(x, grad);
@@ -1277,8 +1300,10 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             }
         );
 
-        let stream_1 = x.stream;
-        let stream_2 = grad.stream;
+        let mut streams = OperationStreams::default();
+        streams.tensor(&x);
+        streams.tensor(&grad);
+
         let out = x
             .client
             .tensor_uninitialized(x.shape.clone(), B::FloatElem::dtype());
@@ -1289,7 +1314,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             out: out.to_ir_out(),
         };
         out.client.register(
-            vec![stream_1, stream_2],
+            streams,
             OperationIr::Module(ModuleOperationIr::AdaptiveAvgPool2dBackward(desc.clone())),
             AdaptiveAvgPool2dBackwardOps::<B>::new(desc),
         );
@@ -1305,14 +1330,16 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         make_ops!(
             InterpolateOps,
             InterpolateOpIr,
-            |args: InterpolateOpIr, handles: &mut HandleContainer<B::Handle>| {
+            |args: &InterpolateOpIr, handles: &mut HandleContainer<B::Handle>| {
                 let x = handles.get_float_tensor::<B>(&args.x);
                 let output = B::interpolate(x, args.output_size, args.options.clone().into());
                 handles.register_float_tensor::<B>(&args.out.id, output);
             }
         );
 
-        let stream = x.stream;
+        let mut streams = OperationStreams::default();
+        streams.tensor(&x);
+
         let shape = vec![x.shape[0], x.shape[1], output_size[0], output_size[1]];
         let out = x.client.tensor_uninitialized(shape, B::FloatElem::dtype());
 
@@ -1324,7 +1351,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         };
 
         out.client.register(
-            vec![stream],
+            streams,
             OperationIr::Module(ModuleOperationIr::Interpolate(desc.clone())),
             InterpolateOps::<B>::new(desc),
         );
@@ -1341,7 +1368,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
         make_ops!(
             InterpolateBackwardOps,
             InterpolateBackwardOpIr,
-            |args: InterpolateBackwardOpIr, handles: &mut HandleContainer<B::Handle>| {
+            |args: &InterpolateBackwardOpIr, handles: &mut HandleContainer<B::Handle>| {
                 let x = handles.get_float_tensor::<B>(&args.x);
                 let grad = handles.get_float_tensor::<B>(&args.grad);
                 let output =
@@ -1351,8 +1378,10 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             }
         );
 
-        let stream_1 = x.stream;
-        let stream_2 = grad.stream;
+        let mut streams = OperationStreams::default();
+        streams.tensor(&x);
+        streams.tensor(&grad);
+
         let out = x
             .client
             .tensor_uninitialized(x.shape.clone(), B::FloatElem::dtype());
@@ -1365,7 +1394,7 @@ impl<B: FusionBackend> ModuleOps<Fusion<B>> for Fusion<B> {
             out: out.to_ir_out(),
         };
         out.client.register(
-            vec![stream_1, stream_2],
+            streams,
             OperationIr::Module(ModuleOperationIr::InterpolateBackward(desc.clone())),
             InterpolateBackwardOps::<B>::new(desc),
         );

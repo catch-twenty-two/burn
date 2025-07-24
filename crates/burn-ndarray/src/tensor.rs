@@ -3,8 +3,8 @@ use core::mem;
 use burn_tensor::{
     DType, Element, Shape, TensorData, TensorMetadata,
     quantization::{
-        AffineQuantization, QParams, QTensorPrimitive, QuantizationMode, QuantizationScheme,
-        QuantizationStrategy, QuantizationType, SymmetricQuantization,
+        QParams, QTensorPrimitive, QuantInputType, QuantLevel, QuantMode, QuantScheme,
+        QuantizationStrategy, SymmetricQuantization,
     },
 };
 
@@ -190,6 +190,8 @@ macro_rules! execute_with_float_dtype {
 }
 
 mod utils {
+    use burn_common::tensor::is_contiguous;
+
     use super::*;
 
     impl<E> NdArrayTensor<E>
@@ -206,6 +208,9 @@ mod utils {
                         if let Some(offset) = offset {
                             vec.drain(..offset);
                         }
+                        if vec.len() > shape.num_elements() {
+                            vec.drain(shape.num_elements()..vec.len());
+                        }
                         vec
                     }
                     Err(array) => array.into_iter().collect(),
@@ -219,40 +224,15 @@ mod utils {
 
         pub(crate) fn is_contiguous(&self) -> bool {
             let shape = self.array.shape();
-            let strides = self.array.strides();
+            let mut strides = Vec::with_capacity(self.array.strides().len());
 
-            if shape.is_empty() {
-                return true;
-            }
-
-            if shape.len() == 1 {
-                return strides[0] == 1;
-            }
-
-            let mut prev_stride = 1;
-            let mut current_num_elems_shape = 1;
-
-            for (i, (stride, shape)) in strides.iter().zip(shape).rev().enumerate() {
-                let stride = if *stride <= 0 {
+            for &stride in self.array.strides() {
+                if stride <= 0 {
                     return false;
-                } else {
-                    *stride as usize
-                };
-                if i > 0 {
-                    if current_num_elems_shape != stride {
-                        return false;
-                    }
-
-                    if prev_stride > stride {
-                        return false;
-                    }
                 }
-
-                current_num_elems_shape *= shape;
-                prev_stride = stride;
+                strides.push(stride as usize);
             }
-
-            true
+            is_contiguous(shape, &strides)
         }
     }
 }
@@ -341,56 +321,29 @@ pub struct NdArrayQTensor<Q: QuantElement> {
     /// The quantized tensor.
     pub qtensor: NdArrayTensor<Q>,
     /// The quantization scheme.
-    pub scheme: QuantizationScheme,
+    pub scheme: QuantScheme,
     /// The quantization parameters.
-    pub qparams: Vec<QParams<f32, Q>>,
+    pub qparams: Vec<QParams<f32>>,
 }
 
 impl<Q: QuantElement> NdArrayQTensor<Q> {
     /// Returns the quantization strategy, including quantization parameters, for the given tensor.
     pub fn strategy(&self) -> QuantizationStrategy {
         match self.scheme {
-            QuantizationScheme::PerTensor(QuantizationMode::Affine, QuantizationType::QInt8) => {
-                QuantizationStrategy::PerTensorAffineInt8(AffineQuantization::init(
-                    self.qparams[0].scale,
-                    self.qparams[0].offset.unwrap().elem(),
-                ))
-            }
-            QuantizationScheme::PerTensor(QuantizationMode::Symmetric, QuantizationType::QInt8) => {
-                QuantizationStrategy::PerTensorSymmetricInt8(SymmetricQuantization::init(
-                    self.qparams[0].scale,
-                ))
-            }
-            QuantizationScheme::PerBlock(
-                QuantizationMode::Affine,
-                QuantizationType::QInt8,
-                layout,
-            ) => QuantizationStrategy::PerBlockAffineInt8(
-                self.qparams
-                    .iter()
-                    .map(|qparams| {
-                        AffineQuantization::init(qparams.scale, qparams.offset.unwrap().elem())
-                    })
-                    .collect(),
-                layout,
-            ),
-            QuantizationScheme::PerBlock(
-                QuantizationMode::Symmetric,
-                QuantizationType::QInt8,
-                layout,
-            ) => QuantizationStrategy::PerBlockSymmetricInt8(
-                self.qparams
-                    .iter()
-                    .map(|qparams| SymmetricQuantization::init(qparams.scale))
-                    .collect(),
-                layout,
-            ),
+            QuantScheme {
+                level: QuantLevel::Tensor,
+                mode: QuantMode::Symmetric,
+                q_type: QuantInputType::QInt8,
+                ..
+            } => QuantizationStrategy::PerTensorSymmetricInt8(SymmetricQuantization::init(
+                self.qparams[0].scales,
+            )),
         }
     }
 }
 
 impl<Q: QuantElement> QTensorPrimitive for NdArrayQTensor<Q> {
-    fn scheme(&self) -> &QuantizationScheme {
+    fn scheme(&self) -> &QuantScheme {
         &self.scheme
     }
 }
@@ -413,8 +366,8 @@ mod tests {
     use burn_common::rand::get_seeded_rng;
     use burn_tensor::{
         Distribution,
-        ops::{FloatTensorOps, IntTensorOps, QTensorOps},
-        quantization::{AffineQuantization, QuantizationParametersPrimitive, QuantizationType},
+        ops::{FloatTensorOps, QTensorOps},
+        quantization::QuantizationParametersPrimitive,
     };
 
     #[test]
@@ -477,22 +430,19 @@ mod tests {
     fn should_support_qtensor_strategy() {
         type B = NdArray<f32, i64, i8>;
         let scale: f32 = 0.009_019_608;
-        let offset: i8 = 72;
         let device = Default::default();
 
         let tensor = B::float_from_data(TensorData::from([-1.8f32, -1.0, 0.0, 0.5]), &device);
-        let scheme =
-            QuantizationScheme::PerTensor(QuantizationMode::Affine, QuantizationType::QInt8);
+        let scheme = QuantScheme::default();
         let qparams = QuantizationParametersPrimitive {
-            scale: B::float_from_data(TensorData::from([scale]), &device),
-            offset: Some(B::int_from_data(TensorData::from([offset as i64]), &device)),
+            scales: B::float_from_data(TensorData::from([scale]), &device),
         };
         let qtensor: NdArrayQTensor<i8> = B::quantize(tensor, &scheme, qparams);
 
         assert_eq!(qtensor.scheme(), &scheme);
         assert_eq!(
             qtensor.strategy(),
-            QuantizationStrategy::PerTensorAffineInt8(AffineQuantization::init(scale, offset))
+            QuantizationStrategy::PerTensorSymmetricInt8(SymmetricQuantization::init(scale))
         );
     }
 }

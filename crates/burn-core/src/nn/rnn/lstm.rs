@@ -357,6 +357,8 @@ mod tests {
     use super::*;
     use crate::tensor::{Device, Distribution, TensorData};
     use crate::{TestBackend, module::Param, nn::LinearRecord};
+    use burn_tensor::{ElementConversion, Tolerance, ops::FloatElem};
+    type FT = FloatElem<TestBackend>;
 
     #[cfg(feature = "std")]
     use crate::TestAutodiffBackend;
@@ -372,10 +374,10 @@ mod tests {
         let gate_to_data =
             |gate: GateController<TestBackend>| gate.input_transform.weight.val().to_data();
 
-        gate_to_data(lstm.input_gate).assert_within_range(0..1);
-        gate_to_data(lstm.forget_gate).assert_within_range(0..1);
-        gate_to_data(lstm.output_gate).assert_within_range(0..1);
-        gate_to_data(lstm.cell_gate).assert_within_range(0..1);
+        gate_to_data(lstm.input_gate).assert_within_range::<FT>(0.elem()..1.elem());
+        gate_to_data(lstm.forget_gate).assert_within_range::<FT>(0.elem()..1.elem());
+        gate_to_data(lstm.output_gate).assert_within_range::<FT>(0.elem()..1.elem());
+        gate_to_data(lstm.cell_gate).assert_within_range::<FT>(0.elem()..1.elem());
     }
 
     /// Test forward pass with simple input vector.
@@ -463,16 +465,23 @@ mod tests {
         let (output, state) = lstm.forward(input, None);
 
         let expected = TensorData::from([[0.046]]);
-        state.cell.to_data().assert_approx_eq(&expected, 3);
+        let tolerance = Tolerance::default();
+        state
+            .cell
+            .to_data()
+            .assert_approx_eq::<FT>(&expected, tolerance);
 
-        let expected = TensorData::from([[0.024]]);
-        state.hidden.to_data().assert_approx_eq(&expected, 3);
+        let expected = TensorData::from([[0.0242]]);
+        state
+            .hidden
+            .to_data()
+            .assert_approx_eq::<FT>(&expected, tolerance);
 
         output
             .select(0, Tensor::arange(0..1, &device))
             .squeeze::<2>(0)
             .to_data()
-            .assert_approx_eq(&state.hidden.to_data(), 3);
+            .assert_approx_eq::<FT>(&state.hidden.to_data(), tolerance);
     }
 
     #[test]
@@ -718,28 +727,29 @@ mod tests {
             lstm.forward(input.clone(), Some(LstmState::new(c0, h0)));
         let (output_without_init_state, state_without_init_state) = lstm.forward(input, None);
 
+        let tolerance = Tolerance::permissive();
         output_with_init_state
             .to_data()
-            .assert_approx_eq(&expected_output_with_init_state, 3);
+            .assert_approx_eq::<FT>(&expected_output_with_init_state, tolerance);
         output_without_init_state
             .to_data()
-            .assert_approx_eq(&expected_output_without_init_state, 3);
+            .assert_approx_eq::<FT>(&expected_output_without_init_state, tolerance);
         state_with_init_state
             .hidden
             .to_data()
-            .assert_approx_eq(&expected_hn_with_init_state, 3);
+            .assert_approx_eq::<FT>(&expected_hn_with_init_state, tolerance);
         state_with_init_state
             .cell
             .to_data()
-            .assert_approx_eq(&expected_cn_with_init_state, 3);
+            .assert_approx_eq::<FT>(&expected_cn_with_init_state, tolerance);
         state_without_init_state
             .hidden
             .to_data()
-            .assert_approx_eq(&expected_hn_without_init_state, 3);
+            .assert_approx_eq::<FT>(&expected_hn_without_init_state, tolerance);
         state_without_init_state
             .cell
             .to_data()
-            .assert_approx_eq(&expected_cn_without_init_state, 3);
+            .assert_approx_eq::<FT>(&expected_cn_without_init_state, tolerance);
     }
 
     #[test]
@@ -749,7 +759,7 @@ mod tests {
         let layer = config.init::<TestBackend>(&Default::default());
 
         assert_eq!(
-            alloc::format!("{}", layer),
+            alloc::format!("{layer}"),
             "Lstm {d_input: 2, d_hidden: 3, bias: true, params: 84}"
         );
     }
@@ -761,7 +771,7 @@ mod tests {
         let layer = config.init::<TestBackend>(&Default::default());
 
         assert_eq!(
-            alloc::format!("{}", layer),
+            alloc::format!("{layer}"),
             "BiLstm {d_input: 2, d_hidden: 3, bias: true, params: 168}"
         );
     }

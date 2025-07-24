@@ -1,5 +1,5 @@
 use super::worker::{ClientRequest, ClientWorker};
-use crate::shared::{ComputeTask, ConnectionId, Task, TaskResponseContent};
+use crate::shared::{ComputeTask, ConnectionId, SessionId, Task, TaskResponseContent};
 use async_channel::Sender;
 use burn_common::id::StreamId;
 use burn_ir::TensorId;
@@ -26,6 +26,7 @@ impl WsClient {
         device: WsDevice,
         sender: Sender<ClientRequest>,
         runtime: Arc<tokio::runtime::Runtime>,
+        session_id: SessionId,
     ) -> Self {
         Self {
             device,
@@ -34,6 +35,7 @@ impl WsClient {
                 sender,
                 position_counter: AtomicU64::new(0),
                 tensor_id_counter: AtomicU64::new(0),
+                session_id,
             }),
         }
     }
@@ -43,6 +45,7 @@ pub(crate) struct WsSender {
     sender: Sender<ClientRequest>,
     position_counter: AtomicU64,
     tensor_id_counter: AtomicU64,
+    session_id: SessionId,
 }
 
 impl WsSender {
@@ -70,7 +73,7 @@ impl WsSender {
     pub(crate) fn send_callback(
         &self,
         task: ComputeTask,
-    ) -> impl Future<Output = TaskResponseContent> + Send {
+    ) -> impl Future<Output = TaskResponseContent> + Send + use<> {
         let position = self
             .position_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -90,5 +93,19 @@ impl WsSender {
                 Err(err) => panic!("{err:?}"),
             }
         }
+    }
+
+    pub(crate) fn close(&mut self) {
+        let sender = self.sender.clone();
+
+        let close_task = ClientRequest::WithoutCallback(Task::Close(self.session_id));
+
+        sender.send_blocking(close_task).unwrap();
+    }
+}
+
+impl Drop for WsSender {
+    fn drop(&mut self) {
+        self.close();
     }
 }

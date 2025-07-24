@@ -194,9 +194,7 @@ impl PoissonNllLoss {
         let targets_dims = targets.dims();
         assert!(
             predictions_dims == targets_dims,
-            "Shape of targets ({:?}) should correspond to outer shape of predictions ({:?}).",
-            targets_dims,
-            predictions_dims
+            "Shape of targets ({targets_dims:?}) should correspond to outer shape of predictions ({predictions_dims:?})."
         );
         assert!(
             targets
@@ -229,6 +227,8 @@ mod tests {
     use crate::TestBackend;
     use crate::tensor::TensorData;
     type TestTensor<const D: usize> = Tensor<TestBackend, D>;
+    use burn_tensor::{Tolerance, ops::FloatElem};
+    type FT = FloatElem<TestBackend>;
 
     #[test]
     fn test_poisson_nll_loss() {
@@ -247,13 +247,18 @@ mod tests {
         let loss_no_reduction = poisson.forward_no_reduction(predictions, targets);
 
         let expected = TensorData::from([1.0000, 1.0000, 100.0000, 2.7183, 7.3891, 14.0855]);
-        loss_no_reduction.into_data().assert_approx_eq(&expected, 5);
+        loss_no_reduction
+            .into_data()
+            .assert_approx_eq::<FT>(&expected, Tolerance::default());
 
         let expected = TensorData::from([21.0321]);
-        loss.into_data().assert_approx_eq(&expected, 5);
+        loss.into_data()
+            .assert_approx_eq::<FT>(&expected, Tolerance::default());
 
         let expected = TensorData::from([126.1929]);
-        loss_sum.into_data().assert_approx_eq(&expected, 5);
+        loss_sum
+            .into_data()
+            .assert_approx_eq::<FT>(&expected, Tolerance::default());
     }
 
     #[test]
@@ -271,7 +276,9 @@ mod tests {
         let loss_no_reduction = poisson.forward_no_reduction(predictions.clone(), targets.clone());
 
         let expected = TensorData::from([36.84136, 2.579441, 1.0, 1.0, 2.71828, 7.38905, 14.0855]);
-        loss_no_reduction.into_data().assert_approx_eq(&expected, 5);
+        loss_no_reduction
+            .into_data()
+            .assert_approx_eq::<FT>(&expected, Tolerance::default());
     }
 
     #[test]
@@ -291,13 +298,18 @@ mod tests {
         let loss_no_reduction = poisson.forward_no_reduction(predictions, targets);
 
         let expected = TensorData::from([1.0000, 4.9393, 101.1678, 2.7183, 7.3891, 14.7373]);
-        loss_no_reduction.into_data().assert_approx_eq(&expected, 5);
+        loss_no_reduction
+            .into_data()
+            .assert_approx_eq::<FT>(&expected, Tolerance::default());
 
         let expected = TensorData::from([21.9920]);
-        loss.into_data().assert_approx_eq(&expected, 5);
+        loss.into_data()
+            .assert_approx_eq::<FT>(&expected, Tolerance::default());
 
         let expected = TensorData::from([131.9518]);
-        loss_sum.into_data().assert_approx_eq(&expected, 5);
+        loss_sum
+            .into_data()
+            .assert_approx_eq::<FT>(&expected, Tolerance::default());
     }
 
     #[cfg(feature = "std")]
@@ -331,10 +343,10 @@ mod tests {
 
         grads_predictions1
             .into_data()
-            .assert_approx_eq(&expected, 5);
+            .assert_approx_eq::<FT>(&expected, Tolerance::default());
         grads_predictions2
             .into_data()
-            .assert_approx_eq(&expected, 5);
+            .assert_approx_eq::<FT>(&expected, Tolerance::default());
     }
 
     #[test]
@@ -397,7 +409,7 @@ mod tests {
         let loss = config.init();
 
         assert_eq!(
-            alloc::format!("{}", loss),
+            alloc::format!("{loss}"),
             "PoissonNllLoss {log_input: true, full: false, eps: 0.00000001}"
         );
     }

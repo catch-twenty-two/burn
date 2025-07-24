@@ -162,7 +162,9 @@ impl<F: FloatCandleElement, I: IntCandleElement> FloatTensorOps<Self> for Candle
         tensor: FloatTensor<Self>,
         indices: IntTensor<Self>,
     ) -> FloatTensor<Self> {
-        CandleTensor::new(tensor.tensor.gather(&indices.tensor, dim).unwrap())
+        let tensor = tensor.tensor.contiguous().unwrap();
+        let indices = indices.tensor.contiguous().unwrap();
+        CandleTensor::new(tensor.gather(&indices, dim).unwrap())
     }
 
     fn float_scatter(
@@ -429,19 +431,6 @@ impl<F: FloatCandleElement, I: IntCandleElement> FloatTensorOps<Self> for Candle
 
     fn float_recip(tensor: FloatTensor<Self>) -> FloatTensor<Self> {
         CandleTensor::new(tensor.tensor.recip().unwrap())
-    }
-
-    fn float_narrow(
-        tensor: FloatTensor<Self>,
-        dim: usize,
-        start: usize,
-        length: usize,
-    ) -> FloatTensor<Self> {
-        super::base::narrow(tensor, dim, start, length)
-    }
-
-    fn float_chunk(tensor: FloatTensor<Self>, chunks: usize, dim: usize) -> Vec<FloatTensor<Self>> {
-        super::base::chunk(tensor, chunks, dim)
     }
 
     fn float_powf(lhs: FloatTensor<Self>, rhs: FloatTensor<Self>) -> FloatTensor<Self> {

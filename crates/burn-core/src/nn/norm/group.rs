@@ -170,7 +170,7 @@ pub(crate) fn group_norm<B: Backend, const D: usize>(
     let mean = input.clone().sum_dim(2) / hidden_size as f64;
     let input = input.sub(mean);
 
-    let var = input.clone().powf_scalar(2.).sum_dim(2) / hidden_size as f64;
+    let var = input.clone().powi_scalar(2).sum_dim(2) / hidden_size as f64;
     let input_normalized = input.div(var.add_scalar(epsilon).sqrt());
 
     if affine {
@@ -192,6 +192,8 @@ mod tests {
     use crate::TestBackend;
     use crate::tensor::TensorData;
     use alloc::format;
+    use burn_tensor::{Tolerance, ops::FloatElem};
+    type FT = FloatElem<TestBackend>;
 
     #[test]
     fn group_norm_forward_affine_false() {
@@ -245,7 +247,9 @@ mod tests {
                 [-0.3428, 0.7970, 1.1845],
             ],
         ]);
-        output.to_data().assert_approx_eq(&expected, 2);
+        output
+            .to_data()
+            .assert_approx_eq::<FT>(&expected, Tolerance::default());
     }
 
     #[test]
@@ -255,13 +259,14 @@ mod tests {
             .with_affine(true)
             .init::<TestBackend>(&device);
 
+        let tolerance = Tolerance::permissive();
         module
             .gamma
             .as_ref()
             .expect("gamma should not be None")
             .val()
             .to_data()
-            .assert_approx_eq(&TensorData::ones::<f32, _>([6]), 2);
+            .assert_approx_eq::<FT>(&TensorData::ones::<f32, _>([6]), tolerance);
 
         module
             .beta
@@ -269,7 +274,7 @@ mod tests {
             .expect("beta should not be None")
             .val()
             .to_data()
-            .assert_approx_eq(&TensorData::zeros::<f32, _>([6]), 2);
+            .assert_approx_eq::<FT>(&TensorData::zeros::<f32, _>([6]), tolerance);
 
         let input = Tensor::<TestBackend, 3>::from_data(
             TensorData::from([
@@ -313,7 +318,9 @@ mod tests {
                 [-1.0903, -0.0419, -1.3623],
             ],
         ]);
-        output.to_data().assert_approx_eq(&expected, 2);
+        output
+            .to_data()
+            .assert_approx_eq::<FT>(&expected, tolerance);
     }
 
     #[test]
@@ -322,7 +329,7 @@ mod tests {
         let group_norm = config.init::<TestBackend>(&Default::default());
 
         assert_eq!(
-            format!("{}", group_norm),
+            format!("{group_norm}"),
             "GroupNorm {num_groups: 3, num_channels: 6, epsilon: 0.00001, affine: true, params: 12}"
         );
     }

@@ -1,12 +1,12 @@
 use super::FusionClient;
 use crate::{
     FusionBackend, FusionDevice, FusionHandle, FusionRuntime, FusionServer, FusionTensor,
-    stream::{StreamId, execution::Operation},
+    stream::{OperationStreams, StreamId, execution::Operation},
 };
-use burn_ir::{OperationIr, TensorId, TensorIr};
-use burn_tensor::DType;
+use burn_ir::{OperationIr, TensorIr};
+use burn_tensor::{DType, TensorData};
 use spin::Mutex;
-use std::{future::Future, sync::Arc};
+use std::sync::Arc;
 
 /// Use a mutex to communicate with the fusion server.
 pub struct MutexFusionClient<R: FusionRuntime> {
@@ -37,13 +37,13 @@ where
         }
     }
 
-    fn register<O>(&self, streams: Vec<StreamId>, repr: OperationIr, operation: O)
+    fn register<O>(&self, streams: OperationStreams, repr: OperationIr, operation: O)
     where
         O: Operation<R> + 'static,
     {
         self.server
             .lock()
-            .register(streams, repr, Box::new(operation))
+            .register(streams, repr, Arc::new(operation))
     }
 
     fn drain(&self) {
@@ -70,7 +70,7 @@ where
     ) -> FusionTensor<R> {
         let mut server = self.server.lock();
         let id = server.create_empty_handle();
-        server.handles.register_handle(*id.as_ref(), handle);
+        server.handles.register_handle(id, handle);
         core::mem::drop(server);
 
         FusionTensor::new(id, shape, dtype, self.clone(), stream)
@@ -80,56 +80,44 @@ where
         self,
         tensor: TensorIr,
         stream: StreamId,
-    ) -> impl Future<Output = burn_tensor::TensorData> + 'static
+    ) -> impl Future<Output = TensorData> + Send
     where
         B: FusionBackend<FusionRuntime = R>,
     {
-        // Clone the Arc to extend its lifetime
-        let server = self.server.clone();
-
-        async move { server.lock().read_float::<B>(tensor, stream).await }
+        self.server.lock().read_float::<B>(tensor, stream)
     }
 
     fn read_tensor_int<B>(
         self,
         tensor: TensorIr,
         id: StreamId,
-    ) -> impl Future<Output = burn_tensor::TensorData> + 'static
+    ) -> impl Future<Output = TensorData> + Send
     where
         B: FusionBackend<FusionRuntime = R>,
     {
-        // Clone the Arc to extend its lifetime
-        let server = self.server.clone();
-
-        async move { server.lock().read_int::<B>(tensor, id).await }
+        self.server.lock().read_int::<B>(tensor, id)
     }
 
     fn read_tensor_bool<B>(
         self,
         tensor: TensorIr,
         stream: StreamId,
-    ) -> impl Future<Output = burn_tensor::TensorData> + 'static
+    ) -> impl Future<Output = TensorData> + Send
     where
         B: FusionBackend<FusionRuntime = R>,
     {
-        // Clone the Arc to extend its lifetime
-        let server = self.server.clone();
-
-        async move { server.lock().read_bool::<B>(tensor, stream).await }
+        self.server.lock().read_bool::<B>(tensor, stream)
     }
 
     fn read_tensor_quantized<B>(
         self,
         tensor: TensorIr,
         stream: StreamId,
-    ) -> impl Future<Output = burn_tensor::TensorData> + 'static
+    ) -> impl Future<Output = TensorData> + Send
     where
         B: FusionBackend<FusionRuntime = R>,
     {
-        // Clone the Arc to extend its lifetime
-        let server = self.server.clone();
-
-        async move { server.lock().read_quantized::<B>(tensor, stream).await }
+        self.server.lock().read_quantized::<B>(tensor, stream)
     }
 
     fn change_client_float<B>(
@@ -216,10 +204,6 @@ where
         core::mem::drop(server_current);
 
         FusionTensor::new(id, tensor.shape, tensor.dtype, client, StreamId::current())
-    }
-
-    fn register_orphan(&self, id: &TensorId) {
-        self.server.lock().drop_tensor_handle(*id);
     }
 
     fn resolve_tensor_float<B>(&self, tensor: FusionTensor<R>) -> B::FloatTensorPrimitive

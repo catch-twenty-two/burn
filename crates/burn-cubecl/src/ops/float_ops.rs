@@ -14,6 +14,7 @@ use burn_tensor::ops::{BoolTensor, Device, FloatElem, FloatTensor, IntTensor};
 use burn_tensor::{DType, ElementConversion, FloatDType};
 use burn_tensor::{Distribution, Shape, TensorData, ops::FloatTensorOps};
 use cubecl::prelude::*;
+use cubecl::reduce::ReducePrecision;
 use cubecl::reduce::instructions::ReduceFnConfig;
 use half::{bf16, f16};
 use std::ops::Range;
@@ -44,7 +45,7 @@ where
             Distribution::Uniform(low, high) => {
                 random_uniform(shape, device, low.elem::<F>(), high.elem())
             }
-            Distribution::Bernoulli(prob) => random_bernoulli(shape, device, prob.elem::<F>()),
+            Distribution::Bernoulli(prob) => random_bernoulli::<R, F>(shape, device, prob as f32),
             Distribution::Normal(mean, std) => {
                 random_normal(shape, device, mean.elem::<F>(), std.elem())
             }
@@ -361,7 +362,7 @@ where
         execute_with_dtype!(
             float(tensor.dtype),
             E,
-            reduce::sum::<R, E>(tensor, Default::default()).unwrap()
+            reduce::sum_fallback::<R, E>(tensor, Default::default()).unwrap()
         )
     }
 
@@ -369,7 +370,7 @@ where
         execute_with_dtype!(
             float(tensor.dtype),
             E,
-            reduce::reduce::<R, E, E>(tensor, Default::default(), ReduceFnConfig::Max).unwrap()
+            reduce::reduce::<R, E, E, E>(tensor, Default::default(), ReduceFnConfig::Max).unwrap()
         )
     }
 
@@ -377,7 +378,7 @@ where
         execute_with_dtype!(
             float(tensor.dtype),
             E,
-            reduce::reduce_dim::<R, E, E>(tensor, dim, Default::default(), ReduceFnConfig::Max)
+            reduce::reduce_dim::<R, E, E, E>(tensor, dim, Default::default(), ReduceFnConfig::Max)
                 .unwrap()
         )
     }
@@ -386,7 +387,7 @@ where
         execute_with_dtype!(
             float(tensor.dtype),
             E,
-            reduce::reduce::<R, E, E>(tensor, Default::default(), ReduceFnConfig::Min).unwrap()
+            reduce::reduce::<R, E, E, E>(tensor, Default::default(), ReduceFnConfig::Min).unwrap()
         )
     }
 
@@ -394,8 +395,31 @@ where
         execute_with_dtype!(
             float(tensor.dtype),
             E,
-            reduce::reduce_dim::<R, E, E>(tensor, dim, Default::default(), ReduceFnConfig::Min)
+            reduce::reduce_dim::<R, E, E, E>(tensor, dim, Default::default(), ReduceFnConfig::Min)
                 .unwrap()
+        )
+    }
+
+    fn float_max_abs(tensor: FloatTensor<Self>) -> FloatTensor<Self> {
+        execute_with_dtype!(
+            float(tensor.dtype),
+            E,
+            reduce::reduce::<R, E, E, E>(tensor, Default::default(), ReduceFnConfig::MaxAbs)
+                .unwrap()
+        )
+    }
+
+    fn float_max_abs_dim(tensor: FloatTensor<Self>, dim: usize) -> FloatTensor<Self> {
+        execute_with_dtype!(
+            float(tensor.dtype),
+            E,
+            reduce::reduce_dim::<R, E, E, E>(
+                tensor,
+                dim,
+                Default::default(),
+                ReduceFnConfig::MaxAbs
+            )
+            .unwrap()
         )
     }
 
@@ -403,8 +427,13 @@ where
         execute_with_dtype!(
             float(tensor.dtype),
             E,
-            reduce::reduce_dim::<R, E, E>(tensor, dim, Default::default(), ReduceFnConfig::Sum)
-                .unwrap()
+            reduce::reduce_dim::<R, E, E, <E as ReducePrecision>::EA>(
+                tensor,
+                dim,
+                Default::default(),
+                ReduceFnConfig::Sum
+            )
+            .unwrap()
         )
     }
 
@@ -412,8 +441,13 @@ where
         execute_with_dtype!(
             float(tensor.dtype),
             E,
-            reduce::reduce_dim::<R, E, E>(tensor, dim, Default::default(), ReduceFnConfig::Mean)
-                .unwrap()
+            reduce::reduce_dim::<R, E, E, <E as ReducePrecision>::EA>(
+                tensor,
+                dim,
+                Default::default(),
+                ReduceFnConfig::Mean
+            )
+            .unwrap()
         )
     }
 
@@ -421,7 +455,12 @@ where
         execute_with_dtype!(
             float(tensor.dtype),
             E,
-            reduce::reduce::<R, E, E>(tensor, Default::default(), ReduceFnConfig::Prod).unwrap()
+            reduce::reduce::<R, E, E, <E as ReducePrecision>::EA>(
+                tensor,
+                Default::default(),
+                ReduceFnConfig::Prod
+            )
+            .unwrap()
         )
     }
 
@@ -429,8 +468,13 @@ where
         execute_with_dtype!(
             float(tensor.dtype),
             E,
-            reduce::reduce_dim::<R, E, E>(tensor, dim, Default::default(), ReduceFnConfig::Prod)
-                .unwrap()
+            reduce::reduce_dim::<R, E, E, <E as ReducePrecision>::EA>(
+                tensor,
+                dim,
+                Default::default(),
+                ReduceFnConfig::Prod
+            )
+            .unwrap()
         )
     }
 
@@ -510,8 +554,13 @@ where
         execute_with_dtype!(
             float(tensor.dtype),
             E,
-            reduce::reduce_dim::<R, E, I>(tensor, dim, Default::default(), ReduceFnConfig::ArgMax)
-                .unwrap()
+            reduce::reduce_dim::<R, E, I, E>(
+                tensor,
+                dim,
+                Default::default(),
+                ReduceFnConfig::ArgMax
+            )
+            .unwrap()
         )
     }
 
@@ -519,8 +568,13 @@ where
         execute_with_dtype!(
             float(tensor.dtype),
             E,
-            reduce::reduce_dim::<R, E, I>(tensor, dim, Default::default(), ReduceFnConfig::ArgMin)
-                .unwrap()
+            reduce::reduce_dim::<R, E, I, E>(
+                tensor,
+                dim,
+                Default::default(),
+                ReduceFnConfig::ArgMin
+            )
+            .unwrap()
         )
     }
 

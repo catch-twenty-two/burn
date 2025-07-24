@@ -2,9 +2,9 @@ use std::future::Future;
 
 use crate::{
     FusionBackend, FusionDevice, FusionHandle, FusionRuntime, FusionTensor,
-    stream::{StreamId, execution::Operation},
+    stream::{OperationStreams, StreamId, execution::Operation},
 };
-use burn_ir::{OperationIr, TensorId, TensorIr};
+use burn_ir::{OperationIr, TensorIr};
 use burn_tensor::{DType, TensorData};
 
 /// Define how to interact with the fusion server.
@@ -15,7 +15,7 @@ where
     /// Create a new client for the given [device](FusionRuntime::FusionDevice).
     fn new(device: FusionDevice<R>) -> Self;
     /// Register a new [tensor operation intermediate representation](OperationIr).
-    fn register<O>(&self, streams: Vec<StreamId>, repr: OperationIr, operation: O)
+    fn register<O>(&self, streams: OperationStreams, repr: OperationIr, operation: O)
     where
         O: Operation<R> + 'static;
     /// Register all lazy computation.
@@ -37,7 +37,7 @@ where
         self,
         tensor: TensorIr,
         stream: StreamId,
-    ) -> impl Future<Output = TensorData> + Send + 'static
+    ) -> impl Future<Output = TensorData> + Send
     where
         B: FusionBackend<FusionRuntime = R>;
     /// Read the values contained by an int tensor.
@@ -45,7 +45,7 @@ where
         self,
         tensor: TensorIr,
         stream: StreamId,
-    ) -> impl Future<Output = TensorData> + Send + 'static
+    ) -> impl Future<Output = TensorData> + Send
     where
         B: FusionBackend<FusionRuntime = R>;
     /// Read the values contained by a bool tensor.
@@ -53,7 +53,7 @@ where
         self,
         tensor: TensorIr,
         stream: StreamId,
-    ) -> impl Future<Output = TensorData> + Send + 'static
+    ) -> impl Future<Output = TensorData> + Send
     where
         B: FusionBackend<FusionRuntime = R>;
     /// Read the values contained by a quantized tensor.
@@ -61,7 +61,7 @@ where
         self,
         tensor: TensorIr,
         streams: StreamId,
-    ) -> impl Future<Output = TensorData> + Send + 'static
+    ) -> impl Future<Output = TensorData> + Send
     where
         B: FusionBackend<FusionRuntime = R>;
     /// Resolve the given float tensor to a primitive tensor.
@@ -112,6 +112,4 @@ where
     ) -> FusionTensor<R>
     where
         B: FusionBackend<FusionRuntime = R>;
-    /// Drop the tensor with the given [tensor id](TensorId).
-    fn register_orphan(&self, id: &TensorId);
 }

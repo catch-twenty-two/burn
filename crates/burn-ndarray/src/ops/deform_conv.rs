@@ -8,7 +8,9 @@ use ndarray::{
     Array2, Array4, ArrayView2, ArrayView3, ArrayView4, ArrayView6, ArrayViewMut2, Axis, Dim, Ix4,
     Zip, s,
 };
+
 #[cfg(not(feature = "std"))]
+#[allow(unused_imports)]
 use num_traits::Float;
 
 use crate::{FloatNdArrayElement, NdArrayTensor};
@@ -617,9 +619,7 @@ pub mod backward {
         });
 
         #[cfg(not(feature = "std"))]
-        run_par!(|| {
-            iter_par!(Zip::indexed(columns)).for_each(|args0, args1| compute_for_each(args0, args1))
-        });
+        run_par!(|| { iter_par!(Zip::indexed(columns)).for_each(&compute_for_each) });
 
         let grad_in: Array1<F> = grad_in
             .into_iter()

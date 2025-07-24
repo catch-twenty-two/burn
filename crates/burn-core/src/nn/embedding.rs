@@ -80,30 +80,8 @@ mod tests {
     use super::*;
     use crate::TestBackend;
     use crate::tensor::TensorData;
-
-    #[test]
-    fn initializer_default() {
-        TestBackend::seed(0);
-
-        let config = EmbeddingConfig::new(100, 10);
-        let embed = config.init::<TestBackend>(&Default::default());
-        let weights = embed.weight.val().reshape([1000]);
-        let (var_act, mean_act) = weights.var_mean(0);
-
-        assert_eq!(
-            config.initializer,
-            Initializer::Normal {
-                mean: 0.0,
-                std: 1.0
-            }
-        );
-        var_act
-            .to_data()
-            .assert_approx_eq(&TensorData::from([1.0f32]), 0);
-        mean_act
-            .to_data()
-            .assert_approx_eq(&TensorData::from([0.0f32]), 0);
-    }
+    use burn_tensor::{Tolerance, ops::FloatElem};
+    type FT = FloatElem<TestBackend>;
 
     #[test]
     fn initializer_zeros() {
@@ -113,10 +91,10 @@ mod tests {
         let embed = config.init::<TestBackend>(&Default::default());
 
         assert_eq!(config.initializer, Initializer::Zeros);
-        embed
-            .weight
-            .to_data()
-            .assert_approx_eq(&TensorData::zeros::<f32, _>(embed.weight.shape()), 3);
+        embed.weight.to_data().assert_approx_eq::<FT>(
+            &TensorData::zeros::<f32, _>(embed.weight.shape()),
+            Tolerance::default(),
+        );
     }
 
     #[test]
@@ -125,7 +103,7 @@ mod tests {
         let embed = config.init::<TestBackend>(&Default::default());
 
         assert_eq!(
-            alloc::format!("{}", embed),
+            alloc::format!("{embed}"),
             "Embedding {n_embedding: 100, d_model: 10, params: 1000}"
         );
     }

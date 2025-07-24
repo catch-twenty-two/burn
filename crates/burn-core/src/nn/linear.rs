@@ -1,3 +1,5 @@
+use burn_tensor::module::linear;
+
 use crate as burn;
 
 use crate::config::Config;
@@ -24,7 +26,7 @@ pub struct LinearConfig {
     pub initializer: Initializer,
 }
 
-/// Applies a linear transformation to the input tensor:
+/// Applies a linear transformation to the input tensor.
 ///
 /// Should be created with [LinearConfig]
 ///
@@ -65,24 +67,24 @@ impl LinearConfig {
 impl<B: Backend> Linear<B> {
     /// Applies the forward pass on the input tensor.
     ///
+    /// # Arguments
+    ///
+    /// - `input` - The input tensor of shape `[..., d_input]`.
+    ///
     /// # Shapes
     ///
     /// - input: `[..., d_input]`
     /// - output: `[..., d_output]`
+    ///
+    /// # Returns
+    ///
+    /// The transformed tensor of shape `[..., d_output]`.
     pub fn forward<const D: usize>(&self, input: Tensor<B, D>) -> Tensor<B, D> {
-        if D == 1 {
-            // Insert and remove an extra batch dimension for the batch matmul to work.
-            return Self::forward::<2>(self, input.unsqueeze()).flatten(0, 1);
-        }
-
-        let weight = self.weight.val().unsqueeze();
-        let bias = self.bias.as_ref().map(|b| b.val().unsqueeze());
-        let output = input.matmul(weight);
-
-        match bias {
-            Some(bias) => output + bias,
-            None => output,
-        }
+        linear(
+            input,
+            self.weight.val(),
+            self.bias.as_ref().map(|b| b.val()),
+        )
     }
 }
 
@@ -108,13 +110,16 @@ mod tests {
     use super::*;
     use crate::TestBackend;
     use crate::tensor::{Shape, TensorData};
+    use burn_tensor::ElementConversion;
+    use burn_tensor::{Tolerance, ops::FloatElem};
+    type FT = FloatElem<TestBackend>;
 
     #[test]
     fn initializer_default() {
         TestBackend::seed(0);
 
         let config = LinearConfig::new(5, 5);
-        let k = (1.0 / config.d_input as f64).sqrt() as f32;
+        let k = (1.0 / config.d_input as f64).sqrt().elem::<FT>();
         let device = Default::default();
         let linear = config.init::<TestBackend>(&device);
 
@@ -137,10 +142,10 @@ mod tests {
         let linear = config.init::<TestBackend>(&device);
 
         assert_eq!(config.initializer, Initializer::Zeros);
-        linear
-            .weight
-            .to_data()
-            .assert_approx_eq(&TensorData::zeros::<f32, _>(linear.weight.shape()), 3);
+        linear.weight.to_data().assert_approx_eq::<FT>(
+            &TensorData::zeros::<f32, _>(linear.weight.shape()),
+            Tolerance::default(),
+        );
     }
 
     #[test]
@@ -203,7 +208,7 @@ mod tests {
         let linear = config.init::<TestBackend>(&Default::default());
 
         assert_eq!(
-            alloc::format!("{}", linear),
+            alloc::format!("{linear}"),
             "Linear {d_input: 3, d_output: 5, bias: true, params: 20}"
         );
     }

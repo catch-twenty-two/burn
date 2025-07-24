@@ -357,6 +357,8 @@ mod tests {
     use crate::tensor::{Distribution, Shape};
     use crate::{TestBackend, nn::attention::generate_autoregressive_mask};
     use alloc::vec::Vec;
+    use burn_tensor::Tolerance;
+    use burn_tensor::ops::FloatElem;
 
     #[test]
     fn test_self_attention_shapes() {
@@ -471,7 +473,7 @@ mod tests {
                     .context
                     .slice([0..batch_size, 0..seq_length - num_padded, 0..d_model])
                     .into_data(),
-                3,
+                Tolerance::<f32>::default(),
             );
     }
 
@@ -509,7 +511,10 @@ mod tests {
         output_1
             .context
             .into_data()
-            .assert_approx_eq(&output_2.into_data(), 3);
+            .assert_approx_eq::<FloatElem<TestBackend>>(
+                &output_2.into_data(),
+                Tolerance::default(),
+            );
     }
 
     #[test]
@@ -518,7 +523,7 @@ mod tests {
         let mha = config.init::<TestBackend>(&Default::default());
 
         assert_eq!(
-            alloc::format!("{}", mha),
+            alloc::format!("{mha}"),
             "MultiHeadAttention {d_model: 2, n_heads: 4, d_k: 0, \
             dropout: 0.1, min_float: -10000, quiet_softmax: false, params: 24}"
         );

@@ -157,9 +157,13 @@ impl<B: Backend> ConvTranspose1d<B> {
 
 #[cfg(test)]
 mod tests {
+    use burn_tensor::ops::FloatElem;
+    use burn_tensor::{ElementConversion, Tolerance};
+
     use super::*;
     use crate::TestBackend;
     use crate::tensor::TensorData;
+    type FT = FloatElem<TestBackend>;
 
     #[test]
     fn initializer_default() {
@@ -167,7 +171,7 @@ mod tests {
 
         let config = ConvTranspose1dConfig::new([5, 1], 5);
         let k = (config.channels[1] * config.kernel_size) as f64;
-        let k = (config.groups as f64 / k).sqrt() as f32;
+        let k = (config.groups as f64 / k).sqrt().elem::<FT>();
         let conv = config.init::<TestBackend>(&Default::default());
 
         conv.weight.to_data().assert_within_range(-k..k);
@@ -181,9 +185,10 @@ mod tests {
         let conv = config.init::<TestBackend>(&Default::default());
 
         assert_eq!(config.initializer, Initializer::Zeros);
-        conv.weight
-            .to_data()
-            .assert_approx_eq(&TensorData::zeros::<f32, _>(conv.weight.shape()), 3);
+        conv.weight.to_data().assert_approx_eq::<f32>(
+            &TensorData::zeros::<f32, _>(conv.weight.shape()),
+            Tolerance::default(),
+        );
     }
 
     #[test]
@@ -192,7 +197,7 @@ mod tests {
         let conv = config.init::<TestBackend>(&Default::default());
 
         assert_eq!(
-            format!("{}", conv),
+            format!("{conv}"),
             "ConvTranspose1d {channels: [5, 2], stride: 1, kernel_size: 5, dilation: 1, groups: 1, padding: 0, padding_out: 0, params: 52}"
         );
     }

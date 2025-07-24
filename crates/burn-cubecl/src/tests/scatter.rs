@@ -2,6 +2,8 @@
 mod tests {
     use super::*;
     use burn_tensor::{Distribution, Int, Tensor, backend::Backend};
+    use burn_tensor::{Tolerance, ops::FloatElem};
+    type FT = FloatElem<TestBackend>;
 
     #[test]
     fn scatter_should_work_with_multiple_workgroups_2d_dim0() {
@@ -42,13 +44,9 @@ mod tests {
         let test_device = Default::default();
         let tensor = Tensor::<TestBackend, D>::random(shape1, Distribution::Default, &test_device);
         let value = Tensor::<TestBackend, D>::random(shape2, Distribution::Default, &test_device);
-        let indices = Tensor::<TestBackend, 1, Int>::from_data(
-            Tensor::<TestBackend, 1>::random(
-                [shape2.iter().product()],
-                Distribution::Uniform(0., shape2[dim] as f64),
-                &test_device,
-            )
-            .into_data(),
+        let indices = Tensor::<TestBackend, 1, Int>::random(
+            [shape2.iter().product()],
+            Distribution::Uniform(0., shape2[dim] as f64),
             &test_device,
         )
         .reshape(shape2);
@@ -63,7 +61,7 @@ mod tests {
 
         expected
             .into_data()
-            .assert_approx_eq(&actual.into_data(), 3);
+            .assert_approx_eq::<FT>(&actual.into_data(), Tolerance::default());
     }
 
     fn same_as_reference_same_shape<const D: usize>(dim: usize, shape: [usize; D]) {

@@ -2,6 +2,28 @@
 mod tests {
     use super::*;
     use burn_tensor::{Bool, Int, Tensor, TensorData};
+    use burn_tensor::{Tolerance, ops::FloatElem};
+    type FT = FloatElem<TestBackend>;
+
+    #[test]
+    fn should_support_mask_fill_swap_dims() {
+        let device = Default::default();
+        let tensor_1 = TestTensorInt::arange(0..16, &device).float();
+        let tensor_1 = tensor_1.reshape([2, 2, 4]);
+        let tensor_1 = tensor_1.swap_dims(0, 2);
+
+        let mask = tensor_1.clone().lower_equal_elem(5.0);
+        let output = tensor_1.clone().mask_fill(mask, -5.0);
+
+        let expected = TensorData::from([
+            [[-5.0, 8.0], [-5.0, 12.0]],
+            [[-5.0, 9.0], [-5.0, 13.0]],
+            [[-5.0, 10.0], [6.0, 14.0]],
+            [[-5.0, 11.0], [7.0, 15.0]],
+        ]);
+
+        output.into_data().assert_eq(&expected, false);
+    }
 
     #[test]
     fn should_support_mask_where_ops() {
@@ -104,7 +126,9 @@ mod tests {
             [f32::NAN, f32::NAN, f32::NAN],
         ]);
 
-        output.into_data().assert_approx_eq(&expected, 5);
+        output
+            .into_data()
+            .assert_approx_eq::<FT>(&expected, Tolerance::default());
     }
 
     #[test]

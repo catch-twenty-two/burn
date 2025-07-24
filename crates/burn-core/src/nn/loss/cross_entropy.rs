@@ -56,8 +56,7 @@ impl CrossEntropyLossConfig {
         if let Some(alpha) = self.smoothing {
             assert!(
                 (0.0..=1.).contains(&alpha),
-                "Alpha of Cross-entropy loss with smoothed labels should be in interval [0, 1]. Got {}",
-                alpha
+                "Alpha of Cross-entropy loss with smoothed labels should be in interval [0, 1]. Got {alpha}"
             );
         };
         if let Some(weights) = self.weights.as_ref() {
@@ -235,9 +234,7 @@ impl<B: Backend> CrossEntropyLoss<B> {
         let [targets_height] = targets.dims();
         assert!(
             logits_height == targets_height,
-            "Shape of targets ({}) should correspond to outer shape of logits ({}).",
-            targets_height,
-            logits_height
+            "Shape of targets ({targets_height}) should correspond to outer shape of logits ({logits_height})."
         );
     }
 }
@@ -247,6 +244,8 @@ mod tests {
     use super::*;
     use crate::TestBackend;
     use crate::tensor::{Distribution, TensorData, loss::cross_entropy_with_logits, ops::IntElem};
+    use burn_tensor::{Tolerance, ops::FloatElem};
+    type FT = FloatElem<TestBackend>;
 
     macro_rules! setup {
         () => {{
@@ -314,7 +313,9 @@ mod tests {
                 .unsqueeze()
                 .repeat_dim(0, 4);
         let loss_2 = loss_2.sum().neg() / (1. + 2. + 3. + 5.);
-        loss_1.into_data().assert_approx_eq(&loss_2.into_data(), 3);
+        loss_1
+            .into_data()
+            .assert_approx_eq::<FT>(&loss_2.into_data(), Tolerance::default());
     }
 
     #[test]
@@ -331,7 +332,9 @@ mod tests {
             .with_smoothing(Some(0.))
             .init(&device)
             .forward(logits.clone(), targets);
-        loss_1.into_data().assert_approx_eq(&loss_2.into_data(), 3);
+        loss_1
+            .into_data()
+            .assert_approx_eq::<FT>(&loss_2.into_data(), Tolerance::default());
     }
 
     #[test]
@@ -343,7 +346,9 @@ mod tests {
             .forward(logits.clone(), targets);
         let loss_2 = cross_entropy_with_logits(logits, targets_logits);
 
-        loss_1.into_data().assert_approx_eq(&loss_2.into_data(), 3);
+        loss_1
+            .into_data()
+            .assert_approx_eq::<FT>(&loss_2.into_data(), Tolerance::default());
     }
 
     #[test]
@@ -358,7 +363,9 @@ mod tests {
             .init(&device)
             .forward(logits, targets);
 
-        loss_1.into_data().assert_approx_eq(&loss_2.into_data(), 3);
+        loss_1
+            .into_data()
+            .assert_approx_eq::<FT>(&loss_2.into_data(), Tolerance::default());
     }
 
     #[test]
@@ -372,7 +379,9 @@ mod tests {
             .forward(logits.clone(), targets);
         let loss_2 = cross_entropy_with_logits(logits, targets_logits);
 
-        loss_1.into_data().assert_approx_eq(&loss_2.into_data(), 3);
+        loss_1
+            .into_data()
+            .assert_approx_eq::<FT>(&loss_2.into_data(), Tolerance::default());
     }
 
     #[test]
@@ -390,7 +399,9 @@ mod tests {
             .init(&logits.device())
             .forward(logits.clone(), targets);
 
-        loss_1.into_data().assert_approx_eq(&loss_2.into_data(), 3);
+        loss_1
+            .into_data()
+            .assert_approx_eq::<FT>(&loss_2.into_data(), Tolerance::default());
     }
 
     #[test]
@@ -409,7 +420,7 @@ mod tests {
         );
         smoothed_targets
             .into_data()
-            .assert_approx_eq(&targets_logits.into_data(), 3);
+            .assert_approx_eq::<FT>(&targets_logits.into_data(), Tolerance::default());
     }
 
     #[test]
@@ -433,7 +444,9 @@ mod tests {
         let x = log_softmax(logits, 1);
         let loss_2 = (x * targets_logits).sum_dim(1).mean().neg();
 
-        loss_1.into_data().assert_approx_eq(&loss_2.into_data(), 3);
+        loss_1
+            .into_data()
+            .assert_approx_eq::<FT>(&loss_2.into_data(), Tolerance::default());
     }
 
     #[test]
@@ -444,7 +457,7 @@ mod tests {
         let loss = config.init::<TestBackend>(&Default::default());
 
         assert_eq!(
-            alloc::format!("{}", loss),
+            alloc::format!("{loss}"),
             "CrossEntropyLoss {pad_tokens: None, weights: Tensor {rank: 1, shape: [3]}, smoothing: 0.5, logits: true}"
         );
     }

@@ -1,11 +1,10 @@
 use alloc::{sync::Arc, vec::Vec};
-use burn_common::stub::Mutex;
+use burn_common::{future::DynFut, stub::Mutex};
 use burn_ir::{
     BackendIr, BaseOperationIr, BoolOperationIr, FloatOperationIr, HandleContainer, IntOperationIr,
     ModuleOperationIr, NumericOperationIr, OperationIr, TensorId, TensorIr, TensorStatus,
 };
 use burn_tensor::{DType, ElementConversion, FloatDType, Shape, TensorData, backend::Backend};
-use core::future::Future;
 
 use super::{RouterTensor, RunnerClient};
 use crate::{
@@ -23,18 +22,8 @@ pub struct RunnerContext<B: BackendIr> {
 
 impl<B: BackendIr> RunnerContext<B> {
     /// Create a new (uninitialized) empty tensor and returns its corresponding [tensor id](TensorId).
-    fn create_empty_handle(&mut self) -> Arc<TensorId> {
+    fn create_empty_handle(&mut self) -> TensorId {
         self.handles.create_tensor_uninit()
-    }
-
-    fn free_orphans(&mut self) {
-        // Passing an empty "remaining" tensor identifiers will remove the orphan handles from the container
-        self.handles.free_orphans(&[])
-    }
-
-    /// Set a tensor handle to be removed.
-    fn drop_tensor_handle(&mut self, id: TensorId) {
-        self.handles.handles_orphan.push(id);
     }
 }
 
@@ -74,7 +63,7 @@ impl<B: BackendIr> Runner<B> {
         let mut ctx = self.context.lock().unwrap();
         let id = ctx.create_empty_handle();
 
-        ctx.handles.register_handle(*id.as_ref(), handle);
+        ctx.handles.register_handle(id, handle);
         core::mem::drop(ctx);
 
         RouterTensor::new(id, shape, dtype, client)
@@ -124,7 +113,7 @@ impl<B: BackendIr> Runner<B> {
         core::mem::drop(ctx);
 
         TensorIr {
-            id: *id,
+            id,
             shape,
             status: TensorStatus::ReadWrite,
             dtype,
@@ -138,7 +127,7 @@ impl<B: BackendIr> Runner<B> {
         core::mem::drop(ctx);
 
         TensorIr {
-            id: *id,
+            id,
             shape,
             status: TensorStatus::NotInit,
             dtype,
@@ -161,7 +150,6 @@ impl<B: BackendIr> RunnerClient for Runner<B> {
     fn register(&self, op: OperationIr) {
         // Remove unused tensor handles
         let mut ctx = self.context.lock().unwrap();
-        ctx.free_orphans();
 
         let handles = &mut ctx.handles;
         match op {
@@ -558,6 +546,12 @@ impl<B: BackendIr> RunnerClient for Runner<B> {
                 NumericOperationIr::MinDim(desc) => {
                     reduce_float_dim_ops!(handles, desc, B::float_min_dim)
                 }
+                NumericOperationIr::MaxAbs(desc) => {
+                    unary_float_ops!(handles, desc, B::float_max_abs)
+                }
+                NumericOperationIr::MaxAbsDim(desc) => {
+                    reduce_float_dim_ops!(handles, desc, B::float_max_abs_dim)
+                }
                 NumericOperationIr::Clamp(desc) => {
                     let tensor = handles.get_float_tensor::<B>(&desc.tensor);
 
@@ -739,6 +733,12 @@ impl<B: BackendIr> RunnerClient for Runner<B> {
                 }
                 NumericOperationIr::MinDim(desc) => {
                     reduce_int_dim_ops!(handles, desc, B::int_min_dim)
+                }
+                NumericOperationIr::MaxAbs(desc) => {
+                    unary_int_ops!(handles, desc, B::int_max_abs)
+                }
+                NumericOperationIr::MaxAbsDim(desc) => {
+                    reduce_int_dim_ops!(handles, desc, B::int_max_abs_dim)
                 }
                 NumericOperationIr::Clamp(desc) => {
                     let tensor = handles.get_int_tensor::<B>(&desc.tensor);
@@ -1211,10 +1211,13 @@ impl<B: BackendIr> RunnerClient for Runner<B> {
             OperationIr::Init(_) => {
                 // Nothing to do.
             }
+            OperationIr::Drop(repr) => {
+                handles.remove_handle(repr.id);
+            }
         }
     }
 
-    fn read_tensor(&self, tensor: TensorIr) -> impl Future<Output = TensorData> + Send {
+    fn read_tensor(&self, tensor: TensorIr) -> DynFut<TensorData> {
         let mut ctx = self.context.lock().unwrap();
 
         enum Output<B: Backend> {
@@ -1238,44 +1241,35 @@ impl<B: BackendIr> RunnerClient for Runner<B> {
             unimplemented!()
         };
 
-        async move {
-            match tensor {
-                Output::Float(val) => B::float_into_data(val).await,
-                Output::Int(val) => B::int_into_data(val).await,
-                Output::Bool(val) => B::bool_into_data(val).await,
-            }
+        match tensor {
+            Output::Float(val) => Box::pin(B::float_into_data(val)),
+            Output::Int(val) => Box::pin(B::int_into_data(val)),
+            Output::Bool(val) => Box::pin(B::bool_into_data(val)),
         }
     }
 
     fn register_tensor_data(&self, data: TensorData) -> RouterTensor<Self> {
         let desc = self.register_tensor_data_desc(data);
-        RouterTensor::new(Arc::new(desc.id), desc.shape, desc.dtype, self.clone())
+        RouterTensor::new(desc.id, desc.shape, desc.dtype, self.clone())
     }
 
     fn register_empty_tensor(&self, shape: Vec<usize>, dtype: DType) -> RouterTensor<Self> {
         let desc = self.register_empty_tensor_desc(shape, dtype);
-        RouterTensor::new(Arc::new(desc.id), desc.shape, desc.dtype, self.clone())
+        RouterTensor::new(desc.id, desc.shape, desc.dtype, self.clone())
     }
 
     fn register_float_tensor(&self, shape: Vec<usize>, dtype: FloatDType) -> RouterTensor<Self> {
         let desc = self.register_float_tensor_desc(shape, dtype);
-        RouterTensor::new(Arc::new(desc.id), desc.shape, desc.dtype, self.clone())
+        RouterTensor::new(desc.id, desc.shape, desc.dtype, self.clone())
     }
 
     fn device(&self) -> Self::Device {
         self.device.clone()
     }
 
-    fn register_orphan(&self, id: &TensorId) {
-        self.context.lock().unwrap().drop_tensor_handle(*id)
-    }
-
-    fn sync(&self) -> impl Future<Output = ()> + Send {
+    fn sync(&self) {
         let device = self.device.clone();
-
-        async move {
-            B::sync(&device);
-        }
+        B::sync(&device);
     }
 
     fn seed(&self, seed: u64) {

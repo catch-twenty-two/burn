@@ -46,7 +46,7 @@ impl MseLoss {
         logits: Tensor<B, D>,
         targets: Tensor<B, D>,
     ) -> Tensor<B, D> {
-        logits.sub(targets).powf_scalar(2.0)
+        logits.sub(targets).powi_scalar(2)
     }
 }
 
@@ -87,6 +87,6 @@ mod tests {
     #[test]
     fn display() {
         let loss = MseLoss::new();
-        assert_eq!(alloc::format!("{}", loss), "MseLoss");
+        assert_eq!(alloc::format!("{loss}"), "MseLoss");
     }
 }

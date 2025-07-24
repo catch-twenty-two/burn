@@ -1,34 +1,128 @@
 use std::ops::Range;
 
 use burn_tensor::{
-    DType, Device, Shape, TensorData,
-    ops::{FloatTensor, IntTensor, QTensorOps, QuantizedTensor},
+    DType, Device, Shape, TensorData, TensorPrimitive,
+    ops::{FloatTensor, FloatTensorOps, IntTensor, QTensorOps, QuantizedTensor},
     quantization::{
-        BlockLayout, QuantizationParametersPrimitive, QuantizationScheme, QuantizationType,
+        QParamTensor, QTensorPrimitive, QuantInputType, QuantLevel, QuantMode, QuantPropagation,
+        QuantScheme, QuantizationParametersPrimitive,
     },
+};
+use cubecl::{
+    Feature, Runtime,
+    client::ComputeClient,
+    ir::{Elem, IntKind},
 };
 
 use crate::{
-    CubeBackend, CubeRuntime, FloatElement, IntElement, element::BoolElement, kernel,
-    tensor::CubeTensor,
+    CubeBackend, CubeRuntime, FloatElement, IntElement,
+    element::BoolElement,
+    execute_with_dtype,
+    kernel::{self, matmul::MatmulStrategy},
+    tensor::{CubeTensor, QParams},
 };
+
+use super::{into_data, permute, swap_dims};
 
 /// Create a quantized tensor with packed values (u32).
 fn new_qtensor<R: CubeRuntime, S: Into<Shape>>(
     data: &[u8],
     shape: S,
-    scheme: QuantizationScheme,
+    scheme: QuantScheme,
     device: &R::Device,
 ) -> CubeTensor<R> {
     let client = R::client(device);
-    let buffer = client.create(data);
+    let shape: Shape = shape.into();
+    let scales_shape: Shape;
+    let scales_dtype = DType::F32; // Make this variable at some point
 
-    CubeTensor::new_contiguous(
+    let (data, shapes, elem_sizes) = match scheme {
+        // Just to ensure we get and error if more modes are added and unhandled
+        QuantScheme {
+            level: QuantLevel::Tensor,
+            mode: QuantMode::Symmetric,
+            q_type: QuantInputType::QInt8,
+            ..
+        } => {
+            let data = vec![&data[..shape.num_elements()], &data[shape.num_elements()..]];
+            let shapes = vec![shape.dims.as_slice(), &[1]];
+            let elem_sizes = vec![size_of::<i8>(), size_of::<f32>()];
+            scales_shape = Shape::new([1]);
+            (data, shapes, elem_sizes)
+        }
+    };
+
+    let mut tensors = client.create_tensors(data, shapes, elem_sizes);
+    let (scales_handle, scales_strides) = tensors.remove(1);
+    let (handle, strides) = tensors.remove(0);
+
+    let scales = QParamTensor {
+        offset_start: scales_handle.offset_start.unwrap_or(0) as usize,
+        offset_end: scales_handle.offset_end.unwrap_or(0) as usize,
+        shape: scales_shape,
+        strides: scales_strides,
+        dtype: scales_dtype,
+    };
+    let qparams = QParams { scales };
+
+    CubeTensor::new_quantized(
         client,
+        handle,
+        shape,
         device.clone(),
-        shape.into(),
-        buffer,
+        strides,
         DType::QFloat(scheme),
+        qparams,
+    )
+}
+
+/// Create an empty quantized tensor.
+pub fn empty_qtensor<R: CubeRuntime>(
+    shape: impl Into<Shape>,
+    scheme: QuantScheme,
+    device: &R::Device,
+) -> CubeTensor<R> {
+    let client = R::client(device);
+    let shape: Shape = shape.into();
+    let scales_shape: Shape;
+    let scales_dtype: DType;
+    let (shapes, elem_sizes) = match scheme {
+        // Just to ensure we get and error if more modes are added and unhandled
+        QuantScheme {
+            level: QuantLevel::Tensor,
+            mode: QuantMode::Symmetric,
+            q_type: QuantInputType::QInt8,
+            ..
+        } => {
+            let shapes = vec![shape.dims.as_slice(), &[1]];
+            let elem_sizes = vec![size_of::<i8>(), size_of::<f32>()];
+            scales_shape = Shape::new([1]);
+            scales_dtype = DType::F32;
+            (shapes, elem_sizes)
+        }
+    };
+
+    let mut tensors = client.empty_tensors(shapes, elem_sizes);
+    let (scales_handle, scales_strides) = tensors.remove(1);
+    let (handle, strides) = tensors.remove(0);
+
+    let scales = QParamTensor {
+        offset_start: scales_handle.offset_start.unwrap_or(0) as usize,
+        offset_end: scales_handle.offset_end.unwrap_or(0) as usize,
+        shape: scales_shape,
+        strides: scales_strides,
+        dtype: scales_dtype,
+    };
+    let qparams = QParams { scales };
+
+    CubeTensor::new_quantized(
+        client,
+        handle,
+        shape,
+        device.clone(),
+        strides,
+        DType::QFloat(scheme),
+        qparams,
     )
 }
 
@@ -42,21 +136,16 @@ where
     fn q_from_data(data: TensorData, device: &Device<Self>) -> QuantizedTensor<Self> {
         match data.dtype {
             DType::QFloat(scheme) => match scheme {
-                QuantizationScheme::PerTensor(_mode, QuantizationType::QInt8)
-                | QuantizationScheme::PerBlock(
-                    _mode,
-                    QuantizationType::QInt8,
-                    BlockLayout::Flat(..),
-                ) => {
+                QuantScheme {
+                    level: QuantLevel::Tensor,
+                    mode: QuantMode::Symmetric,
+                    q_type: QuantInputType::QInt8,
+                    ..
+                } => {
                     // TensorData quantized representation is the same, with multiple quantized values
                     // packed into u32 and quantization parameters appended to the bytes
                     new_qtensor(data.as_bytes(), data.shape.clone(), scheme, device)
                 }
-                QuantizationScheme::PerBlock(
-                    _mode,
-                    QuantizationType::QInt8,
-                    BlockLayout::Grid(..),
-                ) => panic!("Per-block quantization is not supported for grid layout"),
             },
             _ => panic!(
                 "Invalid dtype (expected DType::QFloat, got {:?})",
@@ -69,10 +158,10 @@ where
 
     fn quantize(
         tensor: FloatTensor<Self>,
-        scheme: &QuantizationScheme,
+        scheme: &QuantScheme,
         qparams: QuantizationParametersPrimitive<Self>,
     ) -> QuantizedTensor<Self> {
-        kernel::quantization::quantize::<R, F, I>(tensor, scheme, qparams.scale, qparams.offset)
+        kernel::quantization::quantize::<R, F>(tensor, scheme, qparams.scales)
     }
 
     fn dequantize(tensor: QuantizedTensor<Self>) -> FloatTensor<Self> {
@@ -92,23 +181,35 @@ where
     }
 
     async fn q_into_data(tensor: QuantizedTensor<Self>) -> TensorData {
-        let tensor = kernel::into_contiguous(tensor);
-        let bytes = tensor.client.read_one_async(tensor.handle.binding()).await;
+        if tensor.qparams.is_none() {
+            return execute_with_dtype!(tensor.dtype, E, into_data::<R, E>(tensor).await);
+        }
 
-        // We use the same internal representation
-        TensorData::from_bytes(bytes, tensor.shape, tensor.dtype)
+        let tensor = kernel::into_contiguous_aligned(tensor);
+        let mut data = match tensor.scheme() {
+            QuantScheme {
+                q_type: QuantInputType::QInt8,
+                ..
+            } => into_data::<R, i8>(tensor.clone()).await,
+        };
+        data.dtype = tensor.dtype; // Reset to qfloat after reading
+        let scales = tensor.scales().unwrap();
+        let scales_data = execute_with_dtype!(scales.dtype, E, into_data::<R, E>(scales).await);
+        data.bytes.extend_from_byte_slice(&scales_data.bytes);
+
+        data
     }
 
     fn q_swap_dims(
-        _tensor: QuantizedTensor<Self>,
-        _dim1: usize,
-        _dim2: usize,
+        tensor: QuantizedTensor<Self>,
+        dim1: usize,
+        dim2: usize,
     ) -> QuantizedTensor<Self> {
-        unimplemented!()
+        swap_dims(tensor, dim1, dim2)
     }
 
-    fn q_permute(_tensor: QuantizedTensor<Self>, _axes: &[usize]) -> QuantizedTensor<Self> {
-        unimplemented!()
+    fn q_permute(tensor: QuantizedTensor<Self>, axes: &[usize]) -> QuantizedTensor<Self> {
+        permute(tensor, axes)
     }
 
     fn q_flip(_tensor: QuantizedTensor<Self>, _axes: &[usize]) -> QuantizedTensor<Self> {
@@ -138,4 +239,57 @@ where
     fn q_expand(_tensor: QuantizedTensor<Self>, _shape: Shape) -> QuantizedTensor<Self> {
         unimplemented!()
     }
+
+    fn q_matmul(lhs: QuantizedTensor<Self>, rhs: QuantizedTensor<Self>) -> TensorPrimitive<Self> {
+        if features_enabled::<R>(&lhs.client)
+            && both_matches_symmetric_qint8(lhs.scheme(), rhs.scheme())
+        {
+            let out =
+                kernel::matmul::q_matmul(lhs.clone(), rhs.clone(), None, MatmulStrategy::default());
+            if let Ok(out) = out {
+                return match lhs.scheme().propagation {
+                    QuantPropagation::Propagate => {
+                        TensorPrimitive::QFloat(Self::quantize_dynamic(out, lhs.scheme()))
+                    }
+                    QuantPropagation::Inhibit => TensorPrimitive::Float(out),
+                };
+            }
+        }
+
+        // If the above quantized matmul fail, we fallback to the dequantize-then-matmul pattern.
+        let scheme = *lhs.scheme();
+        let t1_f = <Self>::dequantize(lhs);
+        let t2_f = <Self>::dequantize(rhs);
+        let out = Self::float_matmul(t1_f, t2_f);
+
+        match scheme.propagation {
+            QuantPropagation::Propagate => {
+                TensorPrimitive::QFloat(Self::quantize_dynamic(out, &scheme))
+            }
+            QuantPropagation::Inhibit => TensorPrimitive::Float(out),
+        }
+    }
+}
+
+fn both_matches_symmetric_qint8(lhs: &QuantScheme, rhs: &QuantScheme) -> bool {
+    [lhs, rhs].iter().all(|scheme| {
+        matches!(
+            scheme,
+            QuantScheme {
+                level: QuantLevel::Tensor,
+                mode: QuantMode::Symmetric,
+                q_type: QuantInputType::QInt8,
+                ..
+            }
+        )
+    })
+}
+
+fn features_enabled<R: Runtime>(client: &ComputeClient<R::Server, R::Channel>) -> bool {
+    client
+        .properties()
+        .feature_enabled(Feature::Type(Elem::Int(IntKind::I8)))
+        && client
+            .properties()
+            .feature_enabled(Feature::DynamicLineSize)
 }

@@ -10,7 +10,7 @@
 //! aligns the imported model with Burn's model and converts tensor data into a format compatible with
 //! Burn.
 
-#[cfg(any(feature = "pytorch", feature = "onnx"))]
+#[cfg(any(feature = "pytorch", feature = "onnx", feature = "safetensors"))]
 #[macro_use]
 extern crate derive_new;
 
@@ -29,6 +29,14 @@ pub mod burn;
 /// The PyTorch module for recorder.
 #[cfg(feature = "pytorch")]
 pub mod pytorch;
+
+/// The Safetensors module for recorder.
+#[cfg(feature = "safetensors")]
+pub mod safetensors;
+
+// Enabled when the `pytorch` or `safetensors` feature is enabled.
+#[cfg(any(feature = "pytorch", feature = "safetensors"))]
+mod common;
 
 mod formatter;
 pub use formatter::*;

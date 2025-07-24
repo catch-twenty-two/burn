@@ -5,10 +5,11 @@ use std::{
 };
 
 use crate::node_remap::remap_node_type;
+use crate::util::verify_opsets;
 
 use super::{
     coalesce::coalesce,
-    ir::{Data, OnnxGraph, TensorType},
+    ir::{Data, ElementType, OnnxGraph, TensorData, TensorType},
     proto_conversion::convert_node_proto,
     protos::{ModelProto, NodeProto, TensorProto, ValueInfoProto},
 };
@@ -18,21 +19,29 @@ use super::rank_inference::rank_inference;
 
 use protobuf::Message;
 
-const LIFT_CONSTANTS_FOR_NODE_TYPES: [NodeType; 13] = [
+const LIFT_CONSTANTS_FOR_NODE_TYPES: [NodeType; 18] = [
     NodeType::BatchNormalization,
+    NodeType::InstanceNormalization,
+    NodeType::GroupNormalization,
     NodeType::Clip,
     NodeType::Conv1d,
     NodeType::Conv2d,
     NodeType::Dropout,
     NodeType::Expand,
     NodeType::OneHot,
+    NodeType::ReduceSum,
     NodeType::Reshape,
     NodeType::Resize,
-    NodeType::Unsqueeze,
-    NodeType::ReduceSum,
     NodeType::Slice,
+    NodeType::Split,
     NodeType::Squeeze,
+    NodeType::TopK,
+    NodeType::Trilu,
+    NodeType::Unsqueeze,
 ];
+
+/// Minimum required ONNX opset version
+pub const MIN_OPSET_VERSION: i64 = 16;
 
 #[derive(Debug, Clone)]
 pub(crate) enum IOEntry {
@@ -112,10 +121,7 @@ impl GraphData {
                 if let Some(init_arg) = self.initializers.get(proto_str) {
                     init_arg.clone()
                 } else {
-                    log::warn!(
-                        "Input {} not found, should only happen when peeking",
-                        proto_str
-                    );
+                    log::warn!("Input {proto_str} not found, should only happen when peeking");
                     Argument::new(proto_str.to_string())
                 }
             }
@@ -272,7 +278,7 @@ impl OnnxGraphBuilder {
         } else if self.constants_types.contains(&node.node_type) {
             log::debug!("checking node {} for constants", &node.name);
             for input in node.inputs.iter_mut().skip(1) {
-                log::debug!("checking input {:?} for const", input);
+                log::debug!("checking input {input:?} for const");
                 if let Some(const_idx) = self.constants_map.get(&input.name) {
                     let constant = &graph_data.processed_nodes[*const_idx];
                     log::debug!(
@@ -329,28 +335,42 @@ impl OnnxGraphBuilder {
     }
 }
 
-/// Open an onnx file and convert it to a Graph (intermediate representation)
+/// Parses an ONNX model file and converts it to an intermediate representation.
+///
+/// This function reads an ONNX model from the specified path, validates its opset version,
+/// and transforms it into our internal graph representation for further processing.
 ///
 /// # Arguments
 ///
-/// * `onnx_path` - Path to the onnx file
+/// * `onnx_path` - Path to the ONNX model file
 ///
 /// # Returns
 ///
-/// * `OnnxGraph` - The graph representation of the onnx file
+/// * `OnnxGraph` - The internal graph representation of the ONNX model
 ///
 /// # Panics
 ///
-/// * If the file cannot be opened
-/// * If the file cannot be parsed
-/// * If the nodes are not topologically sorted
+/// * If the file cannot be opened or read
+/// * If the ONNX model cannot be parsed
+/// * If the model uses an unsupported opset version (must be >= MIN_OPSET_VERSION)
+/// * If the nodes in the graph are not topologically sorted
 pub fn parse_onnx(onnx_path: &Path) -> OnnxGraph {
     log::info!("Parsing ONNX file: {}", onnx_path.display());
 
     // Open the file
-    let mut file = File::open(onnx_path).expect("Unable to open file");
+    let mut file = File::open(onnx_path)
+        .unwrap_or_else(|_| panic!("Unable to open file: {}", onnx_path.display()));
     let onnx_model: ModelProto =
         Message::parse_from_reader(&mut file).expect("Unable to parse ONNX file");
+
+    // Check opset versions - must be >= MIN_OPSET_VERSION
+    if !verify_opsets(&onnx_model.opset_import, MIN_OPSET_VERSION) {
+        panic!(
+            "Unsupported ONNX opset version. This implementation requires opset {MIN_OPSET_VERSION} or higher. \
+            Please upgrade your model using the ONNX shape inference tool. \
+            See documentation (https://burn.dev/books/burn/import/onnx-model.html) for details."
+        );
+    }
 
     // ONNX nodes must be topologically sorted per spec:
     // https://github.com/onnx/onnx/blob/main/docs/IR.md#graphs
@@ -367,6 +387,20 @@ pub fn parse_onnx(onnx_path: &Path) -> OnnxGraph {
     );
 
     log::debug!("Number of outputs: {:?}", onnx_model.graph.output.len());
+
+    // Debug information about opset versions
+    for opset in &onnx_model.opset_import {
+        log::debug!(
+            "Opset domain: {:?}, version: {:?}",
+            if opset.domain.is_empty() {
+                "<default>"
+            } else {
+                &opset.domain
+            },
+            opset.version
+        );
+    }
+
     let builder = OnnxGraphBuilder::default();
     let graph = builder.build(&onnx_model);
 
@@ -380,23 +414,24 @@ pub fn parse_onnx(onnx_path: &Path) -> OnnxGraph {
 /// properly deleted if nothing else uses it
 /// Remap the unsqueeze node to a reshape node
 pub(crate) fn remap_unsqueeze_to_reshape(node: &mut Node, out_arg: &Argument) {
-    if let ArgType::Tensor(output_tensor) = &out_arg.ty {
-        let inner = output_tensor
-            .shape
-            .clone()
-            .unwrap()
+    if let Some(value) = &out_arg.value {
+        let shape_vec = value.shape.clone();
+        let inner = shape_vec
             .into_iter()
             .map(|x| x as i64)
             .collect::<Vec<i64>>();
         let shape_len = inner.len();
-        let new_rhs_value = Some(Data::Int64s(inner));
+        let new_rhs_value = Some(TensorData {
+            shape: vec![shape_len],
+            data: Data::Int64s(inner),
+        });
         //moving the remap to here
         let rhs_arg = Argument {
             name: format!("{}_generated_const", &node.name),
             ty: ArgType::Tensor(TensorType {
-                elem_type: super::ir::ElementType::Int64,
+                elem_type: ElementType::Int64,
                 rank: 1,
-                shape: Some(vec![shape_len]),
+                static_shape: Some(vec![shape_len]),
             }),
             value: new_rhs_value,
             passed: false,
@@ -415,15 +450,8 @@ trait TopologicalSortable {
 
 impl TopologicalSortable for Vec<NodeProto> {
     fn is_top_sorted(&self) -> bool {
-        // Create a hashmap to store the position of each node in the vector
-        let position: HashMap<String, usize> = self
-            .iter()
-            .enumerate()
-            .map(|(idx, node)| (node.name.clone(), idx))
-            .collect();
-
         // Iterate over each node in the vector
-        for node in self {
+        for (node_position, node) in self.iter().enumerate() {
             // Iterate over each output of the node
             for output in &node.output {
                 // If the output is empty, we don't want to check the rest of the graph, inputs and outputs that are optional
@@ -432,11 +460,11 @@ impl TopologicalSortable for Vec<NodeProto> {
                     continue;
                 }
                 // Iterate over each other node in the vector
-                for other_node in self {
+                for (other_node_position, other_node) in self.iter().enumerate() {
                     // If the other node has an input that matches the current output
                     if other_node.input.contains(output) {
                         // If the position of the current node is greater than the position of the other node
-                        if position[&node.name] > position[&other_node.name] {
+                        if node_position > other_node_position {
                             // The vector is not topologically sorted
                             return false;
                         }

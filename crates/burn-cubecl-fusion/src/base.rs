@@ -1,11 +1,12 @@
-use std::marker::PhantomData;
-
 use crate::reduce::optimization::{ReduceOptimization, ReduceOptimizationState};
+use std::marker::PhantomData;
 
 use super::elemwise::optimization::{ElemwiseOptimization, ElemwiseOptimizationState};
 use super::matmul::optimization::{MatmulOptimization, MatmulOptimizationState};
 
+use burn_fusion::stream::Context;
 use burn_tensor::DType;
+use burn_tensor::quantization::QParamTensor;
 use cubecl::client::ComputeClient;
 use cubecl::ir::Elem;
 use cubecl::prelude::{TensorArg, TensorHandleRef};
@@ -15,6 +16,7 @@ use serde::{Deserialize, Serialize};
 /// Fusion optimization type for cubecl.
 ///
 /// More optimization variants should be added here.
+#[allow(clippy::large_enum_variant)]
 pub enum CubeOptimization<R: Runtime> {
     /// Element wise optimization.
     ElementWise(ElemwiseOptimization<R>),
@@ -23,16 +25,48 @@ pub enum CubeOptimization<R: Runtime> {
     Reduce(ReduceOptimization<R>),
 }
 
+impl<R: Runtime> core::fmt::Debug for CubeOptimization<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = self.to_opt_state();
+        f.write_fmt(format_args!("{value:?}"))
+    }
+}
+
+impl<R: Runtime> CubeOptimization<R> {
+    pub fn to_opt_state(&self) -> CubeOptimizationState {
+        match self {
+            Self::ElementWise(value) => CubeOptimizationState::ElementWise(value.to_state()),
+            Self::Matmul(value) => CubeOptimizationState::Matmul(value.to_state()),
+            Self::Reduce(value) => CubeOptimizationState::Reduce(value.to_state()),
+        }
+    }
+}
+
+impl<R: Runtime> burn_fusion::NumOperations for CubeOptimization<R> {
+    fn len(&self) -> usize {
+        match self {
+            Self::ElementWise(op) => op.num_ops_fused(),
+            Self::Matmul(op) => op.num_ops_fused(),
+            Self::Reduce(op) => op.num_ops_fused(),
+        }
+    }
+}
+
 /// Fusion optimization state type for cubecl.
 ///
 /// More optimization variants should be added here.
-#[derive(Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum CubeOptimizationState {
     /// Element wise state.
     ElementWise(ElemwiseOptimizationState),
     /// Matrix multiplication optimization state.
     Matmul(MatmulOptimizationState),
     Reduce(ReduceOptimizationState),
+}
+
+pub trait FallbackOperation<R: Runtime>: Send + Sync {
+    fn run(&self, context: &mut Context<'_, CubeFusionHandle<R>>);
 }
 
 pub(crate) fn strides_dyn_rank(shape: &[usize]) -> Vec<usize> {
@@ -72,6 +106,10 @@ pub(crate) fn elem_dtype<E: CubeElement>() -> DType {
     }
 }
 
+/// Runtime parameters for quantization. Can be used to construct a scales handle from the base
+/// tensor handle.
+pub type QParams = burn_tensor::quantization::QParams<QParamTensor>;
+
 /// Handle to be used when fusing operations.
 pub struct CubeFusionHandle<R: Runtime> {
     /// Compute client for jit.
@@ -84,6 +122,8 @@ pub struct CubeFusionHandle<R: Runtime> {
     pub dtype: DType,
     /// The strides of the tensor.
     pub strides: Vec<usize>,
+    /// Quantization runtime parameters, if applicable
+    pub qparams: Option<QParams>,
 }
 
 impl<R: Runtime> core::fmt::Debug for CubeFusionHandle<R> {
@@ -104,6 +144,7 @@ impl<R: Runtime> Clone for CubeFusionHandle<R> {
             device: self.device.clone(),
             strides: self.strides.clone(),
             dtype: self.dtype,
+            qparams: self.qparams.clone(),
         }
     }
 }
@@ -136,34 +177,4 @@ impl<R: Runtime> CubeFusionHandle<R> {
             )
         }
     }
-}
-
-pub(crate) fn is_contiguous(shape: &[usize], strides: &[usize]) -> bool {
-    if shape.is_empty() {
-        return true;
-    }
-
-    if shape.len() == 1 {
-        return strides[0] == 1;
-    }
-
-    let mut prev_stride = 1;
-    let mut current_num_elems_shape = 1;
-
-    for (i, (stride, shape)) in strides.iter().zip(shape).rev().enumerate() {
-        if i > 0 {
-            if current_num_elems_shape != *stride {
-                return false;
-            }
-
-            if prev_stride >= *stride {
-                return false;
-            }
-        }
-
-        current_num_elems_shape *= shape;
-        prev_stride = *stride;
-    }
-
-    true
 }

@@ -7,7 +7,8 @@ use super::{
     block::FuseBlockBuilder,
 };
 use super::{FuseTrace, RegisteredTensors};
-use burn_ir::TensorIr;
+use burn_fusion::stream::ScalarId;
+use burn_ir::{TensorId, TensorIr};
 use burn_tensor::{DType, Element};
 
 #[derive(Clone, Debug)]
@@ -35,9 +36,26 @@ impl FuseTraceBuilder {
         }
     }
 
+    /// Tag a tensor as dropped.
+    pub fn register_dropped(&mut self, id: TensorId) {
+        self.resources.dropped.insert(id);
+    }
+
     /// Register an operation.
     pub fn register_operation(&mut self, op: FuseOp) {
         self.block_current.ops.push(op);
+    }
+
+    /// The number of operations fused.
+    pub fn num_ops_fused(&self) -> u32 {
+        let mut num_ops_fused = 0;
+
+        for (block, _) in self.blocks_previous.iter() {
+            num_ops_fused += block.ops.len();
+        }
+
+        num_ops_fused += self.block_current.ops.len();
+        num_ops_fused as u32
     }
 
     pub fn next_block(&mut self, shape_ref: Vec<usize>, settings: FuseSettings) {
@@ -126,6 +144,10 @@ impl FuseTraceBuilder {
             return None;
         }
 
+        if self.resources.outputs.get(tensor.id).is_some() {
+            return None;
+        }
+
         let input = self.input_unhandled(tensor);
         self.resources.indexed.insert(tensor.id, input.clone());
 
@@ -150,8 +172,9 @@ impl FuseTraceBuilder {
     }
 
     /// Register a scalar value.
-    pub fn scalar<E: Element>(&mut self, _: &E, dtype: DType) -> Arg {
+    pub fn scalar<E: Element>(&mut self, id: &E, dtype: DType) -> Arg {
         let precision = dtype.into();
+        let id = ScalarId { value: id.elem() };
 
         // Bool scalars are encoded as bool_precision.
         let precision = match precision {
@@ -160,7 +183,7 @@ impl FuseTraceBuilder {
         };
         let new_index = self.resources.scalars.len() as u32;
 
-        self.resources.scalars.push((precision, new_index));
+        self.resources.scalars.push((precision, id.value));
         Arg::Scalar(new_index, precision)
     }
 

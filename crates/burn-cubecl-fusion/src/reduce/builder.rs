@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use super::optimization::ReduceInstruction;
 use burn_fusion::{OptimizationBuilder, OptimizationStatus};
 use burn_ir::{NumericOperationIr, OperationIr, ReduceDimOpIr};
@@ -10,11 +8,11 @@ use crate::{
     shared::{
         builder::FuseOptimizationBuilder,
         ir::FusePrecision,
-        settings::{FuseSettings, VectorizationSetting},
+        settings::{FuseSettings, RefLayoutSetting, VectorizationSetting},
     },
 };
 
-use super::optimization::{FusedReduce, ReduceFallbackFn, ReduceOptimization};
+use super::optimization::{FusedReduce, ReduceOptimization};
 
 /// Fused element wise operations that are normally memory bound.
 pub struct ReduceBuilder<R: Runtime> {
@@ -24,29 +22,39 @@ pub struct ReduceBuilder<R: Runtime> {
     device: R::Device,
     reduce: Option<FusedReduce>,
     status: OptimizationStatus,
-    fallback: Arc<dyn ReduceFallbackFn<R>>,
+}
+
+impl<R: Runtime> Clone for ReduceBuilder<R> {
+    fn clone(&self) -> Self {
+        Self {
+            builder: self.builder.clone(),
+            builder_read_fallback: self.builder_read_fallback.clone(),
+            builder_write_fallback: self.builder_write_fallback.clone(),
+            device: self.device.clone(),
+            reduce: self.reduce.clone(),
+            status: self.status,
+        }
+    }
 }
 
 impl<R: Runtime> ReduceBuilder<R> {
-    pub fn new(
-        device: R::Device,
-        bool_precision: FusePrecision,
-        fallback: Arc<dyn ReduceFallbackFn<R>>,
-    ) -> Self {
+    pub fn new(device: R::Device, bool_precision: FusePrecision) -> Self {
         let client = R::client(&device);
         let props = client.properties();
-        let max_bindings = props.hardware_properties().max_bindings;
+        let max_bindings = props.hardware.max_bindings;
         let settings_read = FuseSettings {
             broadcast: true,
             output_shape_updates: true,
-            inplace: true,
+            inplace: false,
             vectorization: VectorizationSetting::Activated,
+            ref_layout: RefLayoutSetting::OnlyContiguous,
         };
         let settings_write = FuseSettings {
             broadcast: true,
             output_shape_updates: false,
             inplace: true,
             vectorization: VectorizationSetting::SmallerOrEqualThanPreviousBlock,
+            ref_layout: RefLayoutSetting::Any,
         };
 
         Self {
@@ -64,7 +72,6 @@ impl<R: Runtime> ReduceBuilder<R> {
             device,
             reduce: None,
             status: OptimizationStatus::Open,
-            fallback,
         }
     }
 
@@ -101,9 +108,22 @@ impl<R: Runtime> ReduceBuilder<R> {
             self.status = OptimizationStatus::Closed;
         }
 
+        let acc = match inst {
+            ReduceInstruction::Mean | ReduceInstruction::Prod | ReduceInstruction::Sum => {
+                match input.precision() {
+                    FusePrecision::F16 | FusePrecision::BF16 => FusePrecision::F32,
+                    FusePrecision::I16 | FusePrecision::I8 => FusePrecision::I32,
+                    FusePrecision::U16 | FusePrecision::U8 => FusePrecision::U32,
+                    _ => input.precision(),
+                }
+            }
+            _ => input.precision(),
+        };
+
         self.reduce = Some(FusedReduce::new(
             input,
             output,
+            acc,
             axis,
             op.clone(),
             ReduceStrategy {
@@ -168,6 +188,9 @@ impl<R: Runtime> OptimizationBuilder<CubeOptimization<R>> for ReduceBuilder<R> {
                     NumericOperationIr::MaxDim(op) => {
                         self.on_reduce(op, ReduceInstruction::Max);
                     }
+                    NumericOperationIr::MaxAbsDim(op) => {
+                        self.on_reduce(op, ReduceInstruction::MaxAbs);
+                    }
                     _ => {
                         self.on_elemwise_read(operation);
                     }
@@ -195,7 +218,9 @@ impl<R: Runtime> OptimizationBuilder<CubeOptimization<R>> for ReduceBuilder<R> {
                     NumericOperationIr::MaxDim(op) => {
                         self.on_reduce(op, ReduceInstruction::Max);
                     }
-
+                    NumericOperationIr::MaxAbsDim(op) => {
+                        self.on_reduce(op, ReduceInstruction::MaxAbs);
+                    }
                     _ => {
                         self.on_elemwise_read(operation);
                     }
@@ -222,8 +247,8 @@ impl<R: Runtime> OptimizationBuilder<CubeOptimization<R>> for ReduceBuilder<R> {
             client,
             self.device.clone(),
             self.len(),
+            self.builder_read_fallback.len(),
             fuse_reduce.clone(),
-            self.fallback.clone(),
         );
 
         CubeOptimization::Reduce(reduce)
@@ -256,5 +281,9 @@ impl<R: Runtime> OptimizationBuilder<CubeOptimization<R>> for ReduceBuilder<R> {
 
     fn len(&self) -> usize {
         self.builder.len() + if self.reduce.is_some() { 1 } else { 0 }
+    }
+
+    fn clone_dyn(&self) -> Box<dyn OptimizationBuilder<CubeOptimization<R>>> {
+        Box::new(self.clone())
     }
 }

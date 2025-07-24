@@ -15,6 +15,7 @@ use burn_tensor::ops::{BoolTensor, Device, FloatTensor, IntElem, IntTensor};
 use burn_tensor::{Distribution, ElementConversion, Shape, TensorData, ops::IntTensorOps};
 use cubecl::frontend::Numeric;
 use cubecl::prelude::*;
+use cubecl::reduce::ReducePrecision;
 use cubecl::reduce::instructions::ReduceFnConfig;
 use std::ops::Range;
 
@@ -205,50 +206,82 @@ where
     }
 
     fn int_sum(tensor: IntTensor<Self>) -> IntTensor<Self> {
-        reduce::sum::<R, I>(tensor, Default::default()).unwrap()
+        reduce::sum_fallback::<R, I>(tensor, Default::default()).unwrap()
     }
 
     fn int_sum_dim(tensor: IntTensor<Self>, dim: usize) -> IntTensor<Self> {
-        reduce::reduce_dim::<R, I, I>(tensor, dim, Default::default(), ReduceFnConfig::Sum).unwrap()
+        reduce::reduce_dim::<R, I, I, <I as ReducePrecision>::EA>(
+            tensor,
+            dim,
+            Default::default(),
+            ReduceFnConfig::Sum,
+        )
+        .unwrap()
     }
 
     fn int_prod(tensor: IntTensor<Self>) -> IntTensor<Self> {
-        reduce::reduce::<R, I, I>(tensor, Default::default(), ReduceFnConfig::Prod).unwrap()
+        reduce::reduce::<R, I, I, <I as ReducePrecision>::EA>(
+            tensor,
+            Default::default(),
+            ReduceFnConfig::Prod,
+        )
+        .unwrap()
     }
 
     fn int_prod_dim(tensor: IntTensor<Self>, dim: usize) -> IntTensor<Self> {
-        reduce::reduce_dim::<R, I, I>(tensor, dim, Default::default(), ReduceFnConfig::Prod)
-            .unwrap()
+        reduce::reduce_dim::<R, I, I, <I as ReducePrecision>::EA>(
+            tensor,
+            dim,
+            Default::default(),
+            ReduceFnConfig::Prod,
+        )
+        .unwrap()
     }
 
     fn int_max(tensor: IntTensor<Self>) -> IntTensor<Self> {
-        reduce::reduce::<R, I, I>(tensor, Default::default(), ReduceFnConfig::Max).unwrap()
+        reduce::reduce::<R, I, I, I>(tensor, Default::default(), ReduceFnConfig::Max).unwrap()
     }
 
     fn int_max_dim(tensor: IntTensor<Self>, dim: usize) -> IntTensor<Self> {
-        reduce::reduce_dim::<R, I, I>(tensor, dim, Default::default(), ReduceFnConfig::Max).unwrap()
-    }
-
-    fn int_min(tensor: IntTensor<Self>) -> IntTensor<Self> {
-        reduce::reduce::<R, I, I>(tensor, Default::default(), ReduceFnConfig::Min).unwrap()
-    }
-
-    fn int_min_dim(tensor: IntTensor<Self>, dim: usize) -> IntTensor<Self> {
-        reduce::reduce_dim::<R, I, I>(tensor, dim, Default::default(), ReduceFnConfig::Min).unwrap()
-    }
-
-    fn int_mean_dim(tensor: IntTensor<Self>, dim: usize) -> IntTensor<Self> {
-        reduce::reduce_dim::<R, I, I>(tensor, dim, Default::default(), ReduceFnConfig::Mean)
+        reduce::reduce_dim::<R, I, I, I>(tensor, dim, Default::default(), ReduceFnConfig::Max)
             .unwrap()
     }
 
+    fn int_max_abs(tensor: IntTensor<Self>) -> IntTensor<Self> {
+        reduce::reduce::<R, I, I, I>(tensor, Default::default(), ReduceFnConfig::MaxAbs).unwrap()
+    }
+
+    fn int_max_abs_dim(tensor: IntTensor<Self>, dim: usize) -> IntTensor<Self> {
+        reduce::reduce_dim::<R, I, I, I>(tensor, dim, Default::default(), ReduceFnConfig::MaxAbs)
+            .unwrap()
+    }
+
+    fn int_min(tensor: IntTensor<Self>) -> IntTensor<Self> {
+        reduce::reduce::<R, I, I, I>(tensor, Default::default(), ReduceFnConfig::Min).unwrap()
+    }
+
+    fn int_min_dim(tensor: IntTensor<Self>, dim: usize) -> IntTensor<Self> {
+        reduce::reduce_dim::<R, I, I, I>(tensor, dim, Default::default(), ReduceFnConfig::Min)
+            .unwrap()
+    }
+
+    fn int_mean_dim(tensor: IntTensor<Self>, dim: usize) -> IntTensor<Self> {
+        reduce::reduce_dim::<R, I, I, <I as ReducePrecision>::EA>(
+            tensor,
+            dim,
+            Default::default(),
+            ReduceFnConfig::Mean,
+        )
+        .unwrap()
+    }
+
     fn int_argmax(tensor: IntTensor<Self>, dim: usize) -> IntTensor<Self> {
-        reduce::reduce_dim::<R, I, I>(tensor, dim, Default::default(), ReduceFnConfig::ArgMax)
+        reduce::reduce_dim::<R, I, I, I>(tensor, dim, Default::default(), ReduceFnConfig::ArgMax)
             .unwrap()
     }
 
     fn int_argmin(tensor: IntTensor<Self>, dim: usize) -> IntTensor<Self> {
-        reduce::reduce_dim::<R, I, I>(tensor, dim, Default::default(), ReduceFnConfig::ArgMin)
+        reduce::reduce_dim::<R, I, I, I>(tensor, dim, Default::default(), ReduceFnConfig::ArgMin)
             .unwrap()
     }
 
@@ -300,18 +333,16 @@ where
         distribution: Distribution,
         device: &Device<Self>,
     ) -> IntTensor<Self> {
-        let float_tensor = match distribution {
-            Distribution::Default => random_uniform(shape, device, 0.elem::<F>(), 255.elem()),
+        match distribution {
+            Distribution::Default => random_uniform(shape, device, 0.elem::<I>(), 255.elem()),
             Distribution::Uniform(low, high) => {
-                random_uniform(shape, device, low.elem::<F>(), high.elem())
+                random_uniform(shape, device, low.elem::<I>(), high.elem())
             }
-            Distribution::Bernoulli(prob) => random_bernoulli(shape, device, prob.elem::<F>()),
+            Distribution::Bernoulli(prob) => random_bernoulli::<R, I>(shape, device, prob as f32),
             Distribution::Normal(mean, std) => {
-                random_normal(shape, device, mean.elem::<F>(), std.elem())
+                random_normal(shape, device, mean.elem::<I>(), std.elem())
             }
-        };
-
-        kernel::cast::<R, F, I>(float_tensor)
+        }
     }
 
     fn int_permute(tensor: IntTensor<Self>, axes: &[usize]) -> IntTensor<Self> {

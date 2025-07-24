@@ -2,6 +2,8 @@
 mod tests {
     use super::*;
     use burn_tensor::{Distribution, Int, Tensor, backend::Backend};
+    use burn_tensor::{Tolerance, ops::FloatElem};
+    type FT = FloatElem<TestBackend>;
 
     #[test]
     fn select_assign_should_work_with_multiple_workgroups_2d_dim0() {
@@ -34,13 +36,9 @@ mod tests {
             Tensor::<TestBackend, D>::random(shape, Distribution::Default, &Default::default());
         let value =
             Tensor::<TestBackend, D>::random(shape, Distribution::Default, &Default::default());
-        let indices = Tensor::<TestBackend, 1, Int>::from_data(
-            Tensor::<TestBackend, 1>::random(
-                [shape[dim]],
-                Distribution::Uniform(0., shape[dim] as f64),
-                &Default::default(),
-            )
-            .into_data(),
+        let indices = Tensor::<TestBackend, 1, Int>::random(
+            [shape[dim]],
+            Distribution::Uniform(0., shape[dim] as f64),
             &Default::default(),
         );
         let tensor_ref =
@@ -55,6 +53,6 @@ mod tests {
 
         expected
             .into_data()
-            .assert_approx_eq(&actual.into_data(), 3);
+            .assert_approx_eq::<FT>(&actual.into_data(), Tolerance::default());
     }
 }

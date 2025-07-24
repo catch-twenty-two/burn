@@ -1,8 +1,9 @@
 use alloc::vec::Vec;
 
-use crate::{alloc::borrow::ToOwned, cast::ToElement};
+use crate::{TensorMetadata, alloc::borrow::ToOwned};
 
 use crate::TensorPrimitive;
+use crate::quantization::QTensorPrimitive;
 use crate::{
     BasicOps, Bool, Distribution, Element, ElementConversion, Float, Int, Shape, Tensor,
     TensorKind,
@@ -11,12 +12,6 @@ use crate::{
     check::TensorCheck,
     ops::{Device, IntTensor},
 };
-
-/// Default RTOL value for `is_close` and `all_close`.
-pub const DEFAULT_RTOL: f64 = 1e-5;
-
-/// Default ATOL value for `is_close` and `all_close`.
-pub const DEFAULT_ATOL: f64 = 1e-8;
 
 impl<B, const D: usize, K> Tensor<B, D, K>
 where
@@ -1145,6 +1140,48 @@ where
         self.mask_where(mask, other)
     }
 
+    /// Find the maximum absolute value.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use burn_tensor::backend::Backend;
+    /// use burn_tensor::{Tensor, Shape};
+    ///
+    /// fn example<B: Backend>() {
+    ///   let device = B::Device::default();
+    ///   let tensor = Tensor::<B, 2>::from_data([[1.0, -7.0, 3.0], [5.0, -1.0, 6.0]], &device);
+    ///   let tensor = tensor.max_abs();
+    ///   println!("{tensor}");
+    ///   // [7.0]
+    /// }
+    /// ```
+    pub fn max_abs(self) -> Tensor<B, 1, K> {
+        Tensor::new(K::max_abs(self.primitive))
+    }
+
+    /// Find the maximum absolute value along the given dimension.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use burn_tensor::backend::Backend;
+    /// use burn_tensor::{Tensor, Shape};
+    ///
+    /// fn example<B: Backend>() {
+    ///   let device = B::Device::default();
+    ///   let tensor = Tensor::<B, 2>::from_data([[1.0, -2.0, 3.0], [5.0, 9.0, 6.0]], &device);
+    ///   let tensor = tensor.max_dim(0);
+    ///   println!("{tensor}");
+    ///   // [[5.0, 9.0, 6.0]]
+    /// }
+    /// ```
+    pub fn max_abs_dim(self, dim: usize) -> Tensor<B, D, K> {
+        check!(TensorCheck::aggregate_dim::<D>("MaxAbs", dim));
+
+        Tensor::new(K::max_abs_dim(self.primitive, dim))
+    }
+
     /// Applies the argmin function along the given dimension and returns an integer tensor.
     ///
     /// # Example
@@ -1576,99 +1613,6 @@ where
         Self::new(K::powi_scalar::<E>(self.primitive, other))
     }
 
-    /// Checks element wise if the tensor is close to another tensor.
-    ///
-    /// The tolerance is defined by the following equation:
-    ///
-    /// ```text
-    /// abs(a - b) <= (atol + rtol * abs(b))
-    ///
-    /// where `a` is the first tensor, `b` is the second tensor, `rtol` is the relative tolerance,
-    /// and `atol` is the absolute tolerance.
-    /// ```
-    ///
-    /// # Arguments
-    ///
-    /// * `other` - The tensor to compare with.
-    /// * `rtol` - Optional relative tolerance. Default is 1e-5; see `DEFAULT_RTOL`.
-    /// * `atol` - Optional absolute tolerance. Default is 1e-8; see `DEFAULT_ATOL`.
-    ///
-    /// # Returns
-    ///
-    /// A boolean tensor with the same shape as the input tensors.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use burn_tensor::backend::Backend;
-    /// use burn_tensor::{Tensor, Shape};
-    ///
-    /// fn example<B: Backend>() {
-    ///    let device = B::Device::default();
-    ///    let tensor1 = Tensor::<B, 2>::from_data([[1.0, -2.0, 3.0], [5.0, 9.0, 6.0]], &device);
-    ///    let tensor2 = Tensor::<B, 2>::from_data([[1.0, -2.0, 3.0], [5.0, 9.0, 6.0]], &device);
-    ///    let tensor = tensor1.is_close(tensor2, None, None);
-    ///    println!("{tensor}");
-    ///    // [[true, true, true], [true, true, true]]
-    /// }
-    /// ```
-    pub fn is_close(self, other: Self, rtol: Option<f64>, atol: Option<f64>) -> Tensor<B, D, Bool> {
-        let rtol = rtol.unwrap_or(DEFAULT_RTOL);
-        let atol = atol.unwrap_or(DEFAULT_ATOL);
-
-        Tensor::new(K::lower_equal(
-            K::abs(K::sub(self.primitive, other.primitive.clone())),
-            K::add_scalar(K::mul_scalar(K::abs(other.primitive), rtol), atol),
-        ))
-    }
-
-    /// Checks if all elements are close to another tensor.
-    ///
-    /// The tolerance is defined by the following equation:
-    ///
-    /// ```text
-    ///
-    /// abs(a - b) <= (atol + rtol * abs(b))
-    ///
-    /// where `a` is the first tensor, `b` is the second tensor, `rtol` is the relative tolerance,
-    /// and `atol` is the absolute tolerance.
-    ///
-    /// ```
-    ///
-    /// # Arguments
-    ///
-    /// * `other` - The tensor to compare with.
-    /// * `rtol` - Optional relative tolerance. Default is 1e-5; see `DEFAULT_RTOL`.
-    /// * `atol` - Optional absolute tolerance. Default is 1e-8; see `DEFAULT_ATOL`.
-    ///
-    /// # Returns
-    ///
-    /// A boolean scalar.
-    ///
-    /// # Remarks
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use burn_tensor::backend::Backend;
-    /// use burn_tensor::{Tensor, Shape};
-    ///
-    /// fn example<B: Backend>() {
-    ///    let device = B::Device::default();
-    ///    let tensor1 = Tensor::<B, 2>::from_data([[1.0, -2.0, 3.0], [5.0, 9.0, 6.0]], &device);
-    ///    let tensor2 = Tensor::<B, 2>::from_data([[1.0, -2.0, 3.0], [5.0, 9.0, 6.0]], &device);
-    ///    let result = tensor1.all_close(tensor2, None, None);
-    ///    println!("{}", result);
-    ///    // true
-    /// }
-    /// ```
-    pub fn all_close(self, other: Self, rtol: Option<f64>, atol: Option<f64>) -> bool {
-        self.is_close(other, rtol, atol)
-            .all()
-            .into_scalar()
-            .to_bool()
-    }
-
     /// Converts the tensor to a boolean tensor by checking if the elements are non-zero.
     ///
     /// # Returns
@@ -1950,7 +1894,7 @@ where
     ///   println!("{tensor}");
     ///   // [[12.0, 3.0, 6.0], [5.0, -2.0, 3.0]]
     ///   let tensor = tensor.topk(1, 1);
-    ///   println!("{tensor}");   
+    ///   println!("{tensor}");
     ///   // [[12.0], [6.0]]
     /// }
     /// ```
@@ -2161,64 +2105,14 @@ where
         output.scatter(axis as usize, indices_unsqueezed, scatter_on_values)
     }
 
-    /// Returns a new tensor with boolean elements indicating whether each element of the input is NaN.
+    /// Applies the matrix multiplication operation.
     ///
-    /// # Returns
-    ///
-    /// A boolean tensor where `true` indicates NaN and `false` indicates a non-NaN value.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use burn_tensor::backend::Backend;
-    /// use burn_tensor::{Tensor, Bool, Shape};
-    ///
-    /// fn example<B: Backend>() {
-    ///    let device = B::Device::default();
-    ///    let tensor = Tensor::<B, 2>::from_data([[1.0, f64::NAN, 3.0], [5.0, 9.0, 6.0]], &device);
-    ///    let tensor = tensor.is_nan();
-    ///    println!("{tensor}");
-    ///    // [[false, true, false], [false, false, false]]
-    /// }
+    /// ```math
+    /// C = AB
     /// ```
-    pub fn is_nan(&self) -> Tensor<B, D, Bool> {
-        // Check if the input tensor is NaN by comparing it to itself
-        // NaN is the only value that is not equal to itself
-        Tensor::new(K::not_equal(self.primitive.clone(), self.primitive.clone()))
-    }
-
-    /// Checks if the tensor contains any NaN values.
-    ///
-    /// # Returns
-    ///
-    /// A boolean tensor with a single element indicating whether the tensor contains any NaN values.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use burn_tensor::backend::Backend;
-    /// use burn_tensor::{Tensor, Bool, Shape};
-    ///
-    /// fn example<B: Backend>() {
-    ///   let device = B::Device::default();
-    ///   let tensor = Tensor::<B, 2>::from_data([[1.0, -2.0, 3.0], [f64::NAN, 9.0, 6.0]], &device);
-    ///   let tensor = tensor.contains_nan();
-    ///   println!("{tensor}");
-    ///   // [true]
-    ///   let tensor = Tensor::<B, 2>::from_data([[1.0, -2.0, 3.0], [5.0, 9.0, 6.0]], &device);
-    ///   let tensor = tensor.contains_nan();
-    ///   println!("{tensor}");
-    ///   // [false]
-    /// }
-    /// ```
-    pub fn contains_nan(&self) -> Tensor<B, 1, Bool> {
-        // Summing the tensor will result in NaN if the tensor contains any NaN values
-        // This is faster than checking each element individually
-        // because it rolls up the NaN values into a single value
-        let sum = K::sum(self.primitive.clone());
-
-        // Check if the sum is NaN by comparing it to itself
-        Tensor::new(K::not_equal(sum.clone(), sum))
+    pub fn matmul(self, other: Tensor<B, D, K>) -> Tensor<B, D, K> {
+        check!(TensorCheck::matmul(&self, &other));
+        Tensor::new(K::matmul(self.primitive, other.primitive))
     }
 }
 
@@ -3169,7 +3063,8 @@ where
     ///
     /// # Returns
     ///
-    /// A tensor with the same shape as the input tensor, where each element is the maximum element
+    /// A tensor with the same rank as the input tensor, but the given dim set to a shape of 1.
+    /// Each element is the maximum element of the corresponding input dim.
     ///
     /// # Remarks
     ///
@@ -3207,6 +3102,48 @@ where
         dim: usize,
     ) -> (Self::Primitive, B::IntTensorPrimitive);
 
+    /// Gets the maximum elements of a tensor along an axis.
+    ///
+    /// # Arguments
+    ///
+    /// * `dim` - The axis along which to get the maximum elements.
+    ///
+    /// # Returns
+    ///
+    /// A single-element tensor containing the maximum absolute element of the input tensor.
+    ///
+    /// # Remarks
+    ///
+    /// This is a low-level function used internally by the library to call different backend functions
+    /// with static dispatch. It is not designed for direct usage by users, and not recommended to import
+    /// or use this function directly.
+    ///
+    /// For getting the maximum absolute elements of a tensor, users should prefer the
+    /// [Tensor::max_abs](Tensor::max_abs) function, which is more high-level and designed for public use.
+    fn max_abs(tensor: Self::Primitive) -> Self::Primitive;
+
+    /// Gets the maximum elements of a tensor along an axis.
+    ///
+    /// # Arguments
+    ///
+    /// * `tensor` - The tensor to get the maximum elements from.
+    /// * `dim` - The axis along which to get the maximum elements.
+    ///
+    /// # Returns
+    ///
+    /// A tensor with the same rank as the input tensor, but the given dim set to a shape of 1.
+    /// Each element is the maximum absolute element of the corresponding input dim.
+    ///
+    /// # Remarks
+    ///
+    /// This is a low-level function used internally by the library to call different backend functions
+    /// with static dispatch. It is not designed for direct usage by users, and not recommended to import
+    /// or use this function directly.
+    ///
+    /// For getting the maximum elements of a tensor along an axis, users should prefer the
+    /// [Tensor::max_abs_dim](Tensor::max_abs_dim) function, which is more high-level and designed for public use.
+    fn max_abs_dim(tensor: Self::Primitive, dim: usize) -> Self::Primitive;
+
     /// Gets the minimum elements of a tensor along an axis.
     ///
     /// # Arguments
@@ -3236,8 +3173,8 @@ where
     ///
     /// # Returns
     ///
-    /// A tensor with the same shape as the input tensor, where each element is the minimum element
-    /// of the input tensor at the corresponding index along the specified axis.
+    /// A tensor with the same rank as the input tensor, but the given dim set to a shape of 1.
+    /// Each element is the minimum element of the corresponding input dim.
     ///
     /// # Remarks
     ///
@@ -3482,6 +3419,13 @@ where
         dim: usize,
         descending: bool,
     ) -> <Int as TensorKind<B>>::Primitive;
+
+    /// Applies the matrix multiplication operation.
+    ///
+    /// ```math
+    /// C = AB
+    /// ```
+    fn matmul(lhs: Self::Primitive, rhs: Self::Primitive) -> Self::Primitive;
 }
 
 impl<B: Backend> Numeric<B> for Int {
@@ -3661,6 +3605,14 @@ impl<B: Backend> Numeric<B> for Int {
         B::int_max_dim_with_indices(tensor, dim)
     }
 
+    fn max_abs(tensor: Self::Primitive) -> Self::Primitive {
+        B::int_max_abs(tensor)
+    }
+
+    fn max_abs_dim(tensor: Self::Primitive, dim: usize) -> Self::Primitive {
+        B::int_max_abs_dim(tensor, dim)
+    }
+
     fn min(tensor: Self::Primitive) -> Self::Primitive {
         B::int_min(tensor)
     }
@@ -3708,7 +3660,7 @@ impl<B: Backend> Numeric<B> for Int {
     }
 
     fn powi_scalar<E: ElementConversion>(lhs: Self::Primitive, rhs: E) -> Self::Primitive {
-        B::int_powf_scalar(lhs, rhs.elem())
+        B::int_powi_scalar(lhs, rhs.elem())
     }
 
     fn random(shape: Shape, distribution: Distribution, device: &Device<B>) -> Self::Primitive {
@@ -3738,6 +3690,37 @@ impl<B: Backend> Numeric<B> for Int {
     ) -> <Int as TensorKind<B>>::Primitive {
         B::int_argsort(tensor, dim, descending)
     }
+
+    /// Applies the matrix multiplication operation.
+    ///
+    /// `C = AB`
+    ///
+    /// # Panics
+    ///
+    /// If the two tensors don't have a compatible shape.
+    fn matmul(lhs: Self::Primitive, rhs: Self::Primitive) -> Self::Primitive {
+        let mut lhs_shape: Vec<usize> = lhs.shape().dims.clone();
+        lhs_shape.push(1);
+        let lhs_shape: Shape = Shape::from(lhs_shape);
+        let lhs = B::int_reshape(lhs, lhs_shape);
+
+        let mut rhs_shape: Vec<usize> = rhs.shape().dims.clone();
+        rhs_shape.insert(rhs_shape.len() - 2, 1);
+        let rhs_shape: Shape = Shape::from(rhs_shape);
+        let rhs = B::int_reshape(rhs, rhs_shape);
+
+        let p = B::int_mul(lhs, rhs);
+
+        let k = p.shape().num_dims();
+
+        let s = B::int_sum_dim(p, k - 2);
+
+        let mut s_shape = s.shape().dims.clone();
+        s_shape.remove(k - 2);
+        let s_shape = Shape::from(s_shape);
+
+        B::int_reshape(s, s_shape)
+    }
 }
 
 impl<B: Backend> Numeric<B> for Float {
@@ -3746,9 +3729,7 @@ impl<B: Backend> Numeric<B> for Float {
             (TensorPrimitive::Float(lhs), TensorPrimitive::Float(rhs)) => {
                 TensorPrimitive::Float(B::float_add(lhs, rhs))
             }
-            (TensorPrimitive::QFloat(lhs), TensorPrimitive::QFloat(rhs)) => {
-                TensorPrimitive::QFloat(B::q_add(lhs, rhs))
-            }
+            (TensorPrimitive::QFloat(lhs), TensorPrimitive::QFloat(rhs)) => B::q_add(lhs, rhs),
             _ => panic!("Primitive type mismatch for lhs and rhs"),
         }
     }
@@ -3757,9 +3738,7 @@ impl<B: Backend> Numeric<B> for Float {
             TensorPrimitive::Float(lhs) => {
                 TensorPrimitive::Float(B::float_add_scalar(lhs, rhs.elem()))
             }
-            TensorPrimitive::QFloat(lhs) => {
-                TensorPrimitive::QFloat(B::q_add_scalar(lhs, rhs.elem()))
-            }
+            TensorPrimitive::QFloat(lhs) => B::q_add_scalar(lhs, rhs.elem()),
         }
     }
     fn sub(lhs: Self::Primitive, rhs: Self::Primitive) -> <Float as TensorKind<B>>::Primitive {
@@ -3767,9 +3746,7 @@ impl<B: Backend> Numeric<B> for Float {
             (TensorPrimitive::Float(lhs), TensorPrimitive::Float(rhs)) => {
                 TensorPrimitive::Float(B::float_sub(lhs, rhs))
             }
-            (TensorPrimitive::QFloat(lhs), TensorPrimitive::QFloat(rhs)) => {
-                TensorPrimitive::QFloat(B::q_sub(lhs, rhs))
-            }
+            (TensorPrimitive::QFloat(lhs), TensorPrimitive::QFloat(rhs)) => B::q_sub(lhs, rhs),
             _ => panic!("Primitive type mismatch for lhs and rhs"),
         }
     }
@@ -3778,9 +3755,7 @@ impl<B: Backend> Numeric<B> for Float {
             TensorPrimitive::Float(lhs) => {
                 TensorPrimitive::Float(B::float_sub_scalar(lhs, rhs.elem()))
             }
-            TensorPrimitive::QFloat(lhs) => {
-                TensorPrimitive::QFloat(B::q_sub_scalar(lhs, rhs.elem()))
-            }
+            TensorPrimitive::QFloat(lhs) => B::q_sub_scalar(lhs, rhs.elem()),
         }
     }
     fn div(lhs: Self::Primitive, rhs: Self::Primitive) -> <Float as TensorKind<B>>::Primitive {
@@ -3788,9 +3763,7 @@ impl<B: Backend> Numeric<B> for Float {
             (TensorPrimitive::Float(lhs), TensorPrimitive::Float(rhs)) => {
                 TensorPrimitive::Float(B::float_div(lhs, rhs))
             }
-            (TensorPrimitive::QFloat(lhs), TensorPrimitive::QFloat(rhs)) => {
-                TensorPrimitive::QFloat(B::q_div(lhs, rhs))
-            }
+            (TensorPrimitive::QFloat(lhs), TensorPrimitive::QFloat(rhs)) => B::q_div(lhs, rhs),
             _ => panic!("Primitive type mismatch for lhs and rhs"),
         }
     }
@@ -3799,43 +3772,24 @@ impl<B: Backend> Numeric<B> for Float {
             TensorPrimitive::Float(lhs) => {
                 TensorPrimitive::Float(B::float_div_scalar(lhs, rhs.elem()))
             }
-            TensorPrimitive::QFloat(lhs) => {
-                TensorPrimitive::QFloat(B::q_div_scalar(lhs, rhs.elem()))
-            }
+            TensorPrimitive::QFloat(lhs) => B::q_div_scalar(lhs, rhs.elem()),
         }
     }
     fn remainder(
         lhs: Self::Primitive,
         rhs: Self::Primitive,
     ) -> <Float as TensorKind<B>>::Primitive {
-        match (lhs, rhs) {
-            (TensorPrimitive::Float(lhs), TensorPrimitive::Float(rhs)) => {
-                TensorPrimitive::Float(B::float_remainder(lhs, rhs))
-            }
-            (TensorPrimitive::QFloat(lhs), TensorPrimitive::QFloat(rhs)) => {
-                TensorPrimitive::QFloat(B::q_remainder(lhs, rhs))
-            }
-            _ => panic!("Primitive type mismatch for lhs and rhs"),
-        }
+        TensorPrimitive::Float(B::float_remainder(lhs.tensor(), rhs.tensor()))
     }
     fn remainder_scalar<E: ElementConversion>(lhs: Self::Primitive, rhs: E) -> Self::Primitive {
-        match lhs {
-            TensorPrimitive::Float(lhs) => {
-                TensorPrimitive::Float(B::float_remainder_scalar(lhs, rhs.elem()))
-            }
-            TensorPrimitive::QFloat(lhs) => {
-                TensorPrimitive::QFloat(B::q_remainder_scalar(lhs, rhs.elem()))
-            }
-        }
+        TensorPrimitive::Float(B::float_remainder_scalar(lhs.tensor(), rhs.elem()))
     }
     fn mul(lhs: Self::Primitive, rhs: Self::Primitive) -> <Float as TensorKind<B>>::Primitive {
         match (lhs, rhs) {
             (TensorPrimitive::Float(lhs), TensorPrimitive::Float(rhs)) => {
                 TensorPrimitive::Float(B::float_mul(lhs, rhs))
             }
-            (TensorPrimitive::QFloat(lhs), TensorPrimitive::QFloat(rhs)) => {
-                TensorPrimitive::QFloat(B::q_mul(lhs, rhs))
-            }
+            (TensorPrimitive::QFloat(lhs), TensorPrimitive::QFloat(rhs)) => B::q_mul(lhs, rhs),
             _ => panic!("Primitive type mismatch for lhs and rhs"),
         }
     }
@@ -3844,15 +3798,13 @@ impl<B: Backend> Numeric<B> for Float {
             TensorPrimitive::Float(lhs) => {
                 TensorPrimitive::Float(B::float_mul_scalar(lhs, rhs.elem()))
             }
-            TensorPrimitive::QFloat(lhs) => {
-                TensorPrimitive::QFloat(B::q_mul_scalar(lhs, rhs.elem()))
-            }
+            TensorPrimitive::QFloat(lhs) => B::q_mul_scalar(lhs, rhs.elem()),
         }
     }
     fn neg(tensor: Self::Primitive) -> Self::Primitive {
         match tensor {
             TensorPrimitive::Float(tensor) => TensorPrimitive::Float(B::float_neg(tensor)),
-            TensorPrimitive::QFloat(tensor) => TensorPrimitive::QFloat(B::q_neg(tensor)),
+            TensorPrimitive::QFloat(tensor) => B::q_neg(tensor),
         }
     }
     fn zeros(shape: Shape, device: &B::Device) -> Self::Primitive {
@@ -3873,21 +3825,21 @@ impl<B: Backend> Numeric<B> for Float {
     fn sum(tensor: Self::Primitive) -> Self::Primitive {
         match tensor {
             TensorPrimitive::Float(tensor) => TensorPrimitive::Float(B::float_sum(tensor)),
-            TensorPrimitive::QFloat(tensor) => TensorPrimitive::QFloat(B::q_sum(tensor)),
+            TensorPrimitive::QFloat(tensor) => B::q_sum(tensor),
         }
     }
 
     fn sum_dim(tensor: Self::Primitive, dim: usize) -> Self::Primitive {
         match tensor {
             TensorPrimitive::Float(tensor) => TensorPrimitive::Float(B::float_sum_dim(tensor, dim)),
-            TensorPrimitive::QFloat(tensor) => TensorPrimitive::QFloat(B::q_sum_dim(tensor, dim)),
+            TensorPrimitive::QFloat(tensor) => B::q_sum_dim(tensor, dim),
         }
     }
 
     fn prod(tensor: Self::Primitive) -> Self::Primitive {
         match tensor {
             TensorPrimitive::Float(tensor) => TensorPrimitive::Float(B::float_prod(tensor)),
-            TensorPrimitive::QFloat(tensor) => TensorPrimitive::QFloat(B::q_prod(tensor)),
+            TensorPrimitive::QFloat(tensor) => B::q_prod(tensor),
         }
     }
 
@@ -3896,14 +3848,14 @@ impl<B: Backend> Numeric<B> for Float {
             TensorPrimitive::Float(tensor) => {
                 TensorPrimitive::Float(B::float_prod_dim(tensor, dim))
             }
-            TensorPrimitive::QFloat(tensor) => TensorPrimitive::QFloat(B::q_prod_dim(tensor, dim)),
+            TensorPrimitive::QFloat(tensor) => B::q_prod_dim(tensor, dim),
         }
     }
 
     fn mean(tensor: Self::Primitive) -> Self::Primitive {
         match tensor {
             TensorPrimitive::Float(tensor) => TensorPrimitive::Float(B::float_mean(tensor)),
-            TensorPrimitive::QFloat(tensor) => TensorPrimitive::QFloat(B::q_mean(tensor)),
+            TensorPrimitive::QFloat(tensor) => B::q_mean(tensor),
         }
     }
 
@@ -3912,7 +3864,7 @@ impl<B: Backend> Numeric<B> for Float {
             TensorPrimitive::Float(tensor) => {
                 TensorPrimitive::Float(B::float_mean_dim(tensor, dim))
             }
-            TensorPrimitive::QFloat(tensor) => TensorPrimitive::QFloat(B::q_mean_dim(tensor, dim)),
+            TensorPrimitive::QFloat(tensor) => B::q_mean_dim(tensor, dim),
         }
     }
 
@@ -3959,15 +3911,7 @@ impl<B: Backend> Numeric<B> for Float {
         mask: B::BoolTensorPrimitive,
         source: Self::Primitive,
     ) -> Self::Primitive {
-        match (tensor, source) {
-            (TensorPrimitive::Float(tensor), TensorPrimitive::Float(source)) => {
-                TensorPrimitive::Float(B::float_mask_where(tensor, mask, source))
-            }
-            (TensorPrimitive::QFloat(tensor), TensorPrimitive::QFloat(source)) => {
-                TensorPrimitive::QFloat(B::q_mask_where(tensor, mask, source))
-            }
-            _ => panic!("Primitive type mismatch for tensor and source"),
-        }
+        TensorPrimitive::Float(B::float_mask_where(tensor.tensor(), mask, source.tensor()))
     }
 
     fn mask_fill(
@@ -3975,14 +3919,7 @@ impl<B: Backend> Numeric<B> for Float {
         mask: B::BoolTensorPrimitive,
         value: Self::Elem,
     ) -> Self::Primitive {
-        match tensor {
-            TensorPrimitive::Float(tensor) => {
-                TensorPrimitive::Float(B::float_mask_fill(tensor, mask, value))
-            }
-            TensorPrimitive::QFloat(tensor) => {
-                TensorPrimitive::QFloat(B::q_mask_fill(tensor, mask, value))
-            }
-        }
+        TensorPrimitive::Float(B::float_mask_fill(tensor.tensor(), mask, value))
     }
 
     fn select(tensor: Self::Primitive, dim: usize, indices: Tensor<B, 1, Int>) -> Self::Primitive {
@@ -4002,20 +3939,13 @@ impl<B: Backend> Numeric<B> for Float {
         indices: Tensor<B, 1, Int>,
         values: Self::Primitive,
     ) -> Self::Primitive {
-        match (tensor, values) {
-            (TensorPrimitive::Float(tensor), TensorPrimitive::Float(values)) => {
-                TensorPrimitive::Float(B::float_select_assign(
-                    tensor,
-                    dim,
-                    indices.primitive,
-                    values,
-                ))
-            }
-            (TensorPrimitive::QFloat(tensor), TensorPrimitive::QFloat(values)) => {
-                TensorPrimitive::QFloat(B::q_select_assign(tensor, dim, indices.primitive, values))
-            }
-            _ => panic!("Primitive type mismatch for tensor and values"),
-        }
+        // Select assign is ambiguous for QFloat
+        TensorPrimitive::Float(B::float_select_assign(
+            tensor.tensor(),
+            dim,
+            indices.primitive,
+            values.tensor(),
+        ))
     }
 
     fn gather(
@@ -4039,15 +3969,12 @@ impl<B: Backend> Numeric<B> for Float {
         indices: B::IntTensorPrimitive,
         values: Self::Primitive,
     ) -> Self::Primitive {
-        match (tensor, values) {
-            (TensorPrimitive::Float(tensor), TensorPrimitive::Float(values)) => {
-                TensorPrimitive::Float(B::float_scatter(dim, tensor, indices, values))
-            }
-            (TensorPrimitive::QFloat(tensor), TensorPrimitive::QFloat(values)) => {
-                TensorPrimitive::QFloat(B::q_scatter(dim, tensor, indices, values))
-            }
-            _ => panic!("Primitive type mismatch for tensor and values"),
-        }
+        TensorPrimitive::Float(B::float_scatter(
+            dim,
+            tensor.tensor(),
+            indices,
+            values.tensor(),
+        ))
     }
 
     fn argmax(tensor: Self::Primitive, dim: usize) -> IntTensor<B> {
@@ -4129,9 +4056,7 @@ impl<B: Backend> Numeric<B> for Float {
             TensorPrimitive::Float(tensor) => {
                 TensorPrimitive::Float(B::float_clamp(tensor, min, max))
             }
-            TensorPrimitive::QFloat(tensor) => {
-                TensorPrimitive::QFloat(B::q_clamp(tensor, min, max))
-            }
+            TensorPrimitive::QFloat(tensor) => B::q_clamp(tensor, min, max),
         }
     }
 
@@ -4140,7 +4065,7 @@ impl<B: Backend> Numeric<B> for Float {
             TensorPrimitive::Float(tensor) => {
                 TensorPrimitive::Float(B::float_clamp_min(tensor, min))
             }
-            TensorPrimitive::QFloat(tensor) => TensorPrimitive::QFloat(B::q_clamp_min(tensor, min)),
+            TensorPrimitive::QFloat(tensor) => B::q_clamp_min(tensor, min),
         }
     }
 
@@ -4149,7 +4074,7 @@ impl<B: Backend> Numeric<B> for Float {
             TensorPrimitive::Float(tensor) => {
                 TensorPrimitive::Float(B::float_clamp_max(tensor, max))
             }
-            TensorPrimitive::QFloat(tensor) => TensorPrimitive::QFloat(B::q_clamp_max(tensor, max)),
+            TensorPrimitive::QFloat(tensor) => B::q_clamp_max(tensor, max),
         }
     }
 
@@ -4165,9 +4090,7 @@ impl<B: Backend> Numeric<B> for Float {
             (TensorPrimitive::Float(lhs), TensorPrimitive::Float(rhs)) => {
                 TensorPrimitive::Float(B::float_powf(lhs, rhs))
             }
-            (TensorPrimitive::QFloat(lhs), TensorPrimitive::QFloat(rhs)) => {
-                TensorPrimitive::QFloat(B::q_powf(lhs, rhs))
-            }
+            (TensorPrimitive::QFloat(lhs), TensorPrimitive::QFloat(rhs)) => B::q_powf(lhs, rhs),
             _ => panic!("Primitive type mismatch for lhs and rhs"),
         }
     }
@@ -4177,9 +4100,7 @@ impl<B: Backend> Numeric<B> for Float {
             TensorPrimitive::Float(lhs) => {
                 TensorPrimitive::Float(B::float_powf_scalar(lhs, rhs.elem()))
             }
-            TensorPrimitive::QFloat(lhs) => {
-                TensorPrimitive::QFloat(B::q_powf_scalar(lhs, rhs.elem()))
-            }
+            TensorPrimitive::QFloat(lhs) => B::q_powf_scalar(lhs, rhs.elem()),
         }
     }
 
@@ -4188,9 +4109,7 @@ impl<B: Backend> Numeric<B> for Float {
             (TensorPrimitive::Float(lhs), TensorPrimitive::Float(rhs)) => {
                 TensorPrimitive::Float(B::float_powf(lhs, rhs))
             }
-            (TensorPrimitive::QFloat(lhs), TensorPrimitive::QFloat(rhs)) => {
-                TensorPrimitive::QFloat(B::q_powf(lhs, rhs))
-            }
+            (TensorPrimitive::QFloat(lhs), TensorPrimitive::QFloat(rhs)) => B::q_powf(lhs, rhs),
             _ => panic!("Primitive type mismatch for lhs and rhs"),
         }
     }
@@ -4198,11 +4117,9 @@ impl<B: Backend> Numeric<B> for Float {
     fn powi_scalar<E: ElementConversion>(lhs: Self::Primitive, rhs: E) -> Self::Primitive {
         match lhs {
             TensorPrimitive::Float(lhs) => {
-                TensorPrimitive::Float(B::float_powf_scalar(lhs, rhs.elem()))
+                TensorPrimitive::Float(B::float_powi_scalar(lhs, rhs.elem()))
             }
-            TensorPrimitive::QFloat(lhs) => {
-                TensorPrimitive::QFloat(B::q_powf_scalar(lhs, rhs.elem()))
-            }
+            TensorPrimitive::QFloat(lhs) => B::q_powi_scalar(lhs, rhs.elem()),
         }
     }
 
@@ -4252,141 +4169,254 @@ impl<B: Backend> Numeric<B> for Float {
             TensorPrimitive::QFloat(tensor) => B::q_argsort(tensor, dim, descending),
         }
     }
+
+    fn max_abs(tensor: Self::Primitive) -> Self::Primitive {
+        match tensor {
+            TensorPrimitive::Float(tensor) => TensorPrimitive::Float(B::float_max_abs(tensor)),
+            TensorPrimitive::QFloat(tensor) => TensorPrimitive::QFloat(B::q_max_abs(tensor)),
+        }
+    }
+
+    fn max_abs_dim(tensor: Self::Primitive, dim: usize) -> Self::Primitive {
+        match tensor {
+            TensorPrimitive::Float(tensor) => {
+                TensorPrimitive::Float(B::float_max_abs_dim(tensor, dim))
+            }
+            TensorPrimitive::QFloat(tensor) => {
+                TensorPrimitive::QFloat(B::q_max_abs_dim(tensor, dim))
+            }
+        }
+    }
+
+    /// Applies the matrix multiplication operation.
+    ///
+    /// `C = AB`
+    ///
+    /// # Panics
+    ///
+    /// If the two tensors don't have a compatible shape.
+    fn matmul(lhs: Self::Primitive, rhs: Self::Primitive) -> Self::Primitive {
+        match (lhs, rhs) {
+            (TensorPrimitive::QFloat(lhs), TensorPrimitive::QFloat(rhs)) => B::q_matmul(lhs, rhs),
+            (TensorPrimitive::QFloat(lhs), TensorPrimitive::Float(rhs)) => {
+                TensorPrimitive::Float(B::float_matmul(B::dequantize(lhs), rhs))
+            }
+            (TensorPrimitive::Float(lhs), TensorPrimitive::QFloat(rhs)) => {
+                // NOTE: in a typical workflow with linear layers (e.g., transformers), the rhs
+                // represents the weights.
+                //
+                // Since `q_matmul(lhs_f16, rhs_quant)` isn't currently supported, in practice it makes
+                // more sense to re-quantize the input back. Better usability.
+                //
+                // This might change in the future (dequantize on read in fusion?).
+                B::q_matmul(B::quantize_dynamic(lhs, rhs.scheme()), rhs)
+            }
+            (TensorPrimitive::Float(lhs), TensorPrimitive::Float(rhs)) => {
+                TensorPrimitive::Float(B::float_matmul(lhs, rhs))
+            }
+        }
+    }
 }
 
-impl<B, const D: usize, K> core::ops::Add<Self> for Tensor<B, D, K>
+// Tensor + tensor
+impl<B: Backend, const D: usize, K: Numeric<B>> core::ops::Add<Self> for Tensor<B, D, K>
 where
-    B: Backend,
-    K: Numeric<B>,
     K::Elem: Element,
 {
     type Output = Self;
 
-    fn add(self, rhs: Tensor<B, D, K>) -> Self {
+    fn add(self, rhs: Tensor<B, D, K>) -> Self::Output {
         Self::add(self, rhs)
     }
 }
 
-impl<E, const D: usize, B, K> core::ops::Add<E> for Tensor<B, D, K>
+// Tensor + scalar
+impl<E: ElementConversion, const D: usize, B: Backend, K: Numeric<B>> core::ops::Add<E>
+    for Tensor<B, D, K>
 where
-    E: ElementConversion,
-    B: Backend,
-    K: Numeric<B>,
     K::Elem: Element,
 {
     type Output = Self;
 
-    fn add(self, other: E) -> Self {
+    fn add(self, other: E) -> Self::Output {
         Tensor::add_scalar(self, other)
     }
 }
 
-impl<B, const D: usize, K> core::ops::Sub<Tensor<B, D, K>> for Tensor<B, D, K>
+// Scalar + tensor
+macro_rules! impl_tensor_scalar_add {
+    ($($t:ty),*) => {
+        $(
+            impl<const D: usize, B: Backend, K: Numeric<B>> core::ops::Add<Tensor<B, D, K>> for $t
+            where
+                K::Elem: Element,
+            {
+                type Output = Tensor<B, D, K>;
+
+                fn add(self, tensor: Tensor<B, D, K>) -> Self::Output {
+                    Tensor::add_scalar(tensor, self)
+                }
+            }
+        )*
+    }
+}
+impl_tensor_scalar_add!(f32, f64, i32, i64, u32, u64);
+
+// Tensor - tensor
+impl<B: Backend, const D: usize, K: Numeric<B>> core::ops::Sub<Self> for Tensor<B, D, K>
 where
-    B: Backend,
-    K: Numeric<B>,
     K::Elem: Element,
 {
     type Output = Self;
 
-    fn sub(self, rhs: Tensor<B, D, K>) -> Self {
+    fn sub(self, rhs: Tensor<B, D, K>) -> Self::Output {
         Tensor::sub(self, rhs)
     }
 }
 
-impl<E, const D: usize, B, K> core::ops::Sub<E> for Tensor<B, D, K>
+// Tensor - scalar
+impl<E: ElementConversion, const D: usize, B: Backend, K: Numeric<B>> core::ops::Sub<E>
+    for Tensor<B, D, K>
 where
-    E: ElementConversion,
-    B: Backend,
-    K: Numeric<B>,
     K::Elem: Element,
 {
     type Output = Self;
 
-    fn sub(self, other: E) -> Self {
+    fn sub(self, other: E) -> Self::Output {
         Tensor::sub_scalar(self, other)
     }
 }
 
-impl<B, const D: usize, K> core::ops::Div<Tensor<B, D, K>> for Tensor<B, D, K>
+// Scalar - tensor
+macro_rules! impl_tensor_scalar_sub {
+    ($($t:ty),*) => {
+        $(
+            impl<const D: usize, B: Backend, K: Numeric<B>> core::ops::Sub<Tensor<B, D, K>> for $t
+            where
+                K::Elem: Element,
+            {
+                type Output = Tensor<B, D, K>;
+
+                fn sub(self, tensor: Tensor<B, D, K>) -> Self::Output {
+                    Tensor::add_scalar(Tensor::neg(tensor), self)
+                }
+            }
+        )*
+    }
+}
+impl_tensor_scalar_sub!(f32, f64, i32, i64, u32, u64);
+
+// Tensor / tensor
+impl<B: Backend, const D: usize, K: Numeric<B>> core::ops::Div<Self> for Tensor<B, D, K>
 where
-    B: Backend,
-    K: Numeric<B>,
     K::Elem: Element,
 {
     type Output = Self;
 
-    fn div(self, rhs: Tensor<B, D, K>) -> Self {
+    fn div(self, rhs: Self) -> Self::Output {
         Tensor::div(self, rhs)
     }
 }
 
-impl<E, const D: usize, B, K> core::ops::Div<E> for Tensor<B, D, K>
+// Tensor / scalar
+impl<E: ElementConversion, const D: usize, B: Backend, K: Numeric<B>> core::ops::Div<E>
+    for Tensor<B, D, K>
 where
-    E: ElementConversion,
-    B: Backend,
-    K: Numeric<B>,
     K::Elem: Element,
 {
     type Output = Self;
 
-    fn div(self, other: E) -> Self {
+    fn div(self, other: E) -> Self::Output {
         Tensor::div_scalar(self, other)
     }
 }
 
-impl<const D: usize, B, K> core::ops::Rem<Tensor<B, D, K>> for Tensor<B, D, K>
+// Scalar / tensor (float only)
+macro_rules! impl_tensor_scalar_div {
+    ($($t:ty),*) => {
+        $(
+            impl<const D: usize, B: Backend> core::ops::Div<Tensor<B, D>> for $t
+            {
+                type Output = Tensor<B, D>;
+
+                fn div(self, tensor: Tensor<B, D>) -> Self::Output {
+                    tensor.recip().mul_scalar(self)
+                }
+            }
+        )*
+    }
+}
+
+impl_tensor_scalar_div!(f32, f64);
+
+// Tensor % tensor.
+impl<const D: usize, B: Backend, K: Numeric<B>> core::ops::Rem<Self> for Tensor<B, D, K>
 where
-    B: Backend,
-    K: Numeric<B>,
     K::Elem: Element,
 {
     type Output = Self;
-    fn rem(self, rhs: Tensor<B, D, K>) -> Self::Output {
+
+    fn rem(self, rhs: Self) -> Self::Output {
         Tensor::remainder(self, rhs)
     }
 }
 
-impl<E, const D: usize, B, K> core::ops::Rem<E> for Tensor<B, D, K>
+// Tensor % scalar.
+impl<E: ElementConversion, const D: usize, B: Backend, K: Numeric<B>> core::ops::Rem<E>
+    for Tensor<B, D, K>
 where
-    E: ElementConversion,
-    B: Backend,
-    K: Numeric<B>,
     K::Elem: Element,
 {
     type Output = Self;
 
-    fn rem(self, other: E) -> Self {
+    fn rem(self, other: E) -> Self::Output {
         Tensor::remainder_scalar(self, other)
     }
 }
 
-impl<B, const D: usize, K> core::ops::Mul<Tensor<B, D, K>> for Tensor<B, D, K>
+// Tensor * tensor.
+impl<B: Backend, const D: usize, K: Numeric<B>> core::ops::Mul<Self> for Tensor<B, D, K>
 where
-    B: Backend,
-    K: Numeric<B>,
     K::Elem: Element,
 {
     type Output = Self;
 
-    fn mul(self, rhs: Tensor<B, D, K>) -> Self {
+    fn mul(self, rhs: Self) -> Self::Output {
         Tensor::mul(self, rhs)
     }
 }
 
-impl<E, const D: usize, B, K> core::ops::Mul<E> for Tensor<B, D, K>
+// Tensor * scalar.
+impl<E: ElementConversion, const D: usize, B: Backend, K: Numeric<B>> core::ops::Mul<E>
+    for Tensor<B, D, K>
 where
-    E: ElementConversion,
-    B: Backend,
-    K: Numeric<B>,
     K::Elem: Element,
 {
     type Output = Self;
 
-    fn mul(self, other: E) -> Self {
+    fn mul(self, other: E) -> Self::Output {
         Tensor::mul_scalar(self, other)
     }
 }
+
+macro_rules! impl_tensor_scalar_mul {
+    ($($t:ty),*) => {
+        $(
+            impl<const D: usize, B: Backend, K: Numeric<B>> core::ops::Mul<Tensor<B, D, K>> for $t
+            where
+                K::Elem: Element,
+            {
+                type Output = Tensor<B, D, K>;
+
+                fn mul(self, other: Tensor<B, D, K>) -> Self::Output {
+                    Tensor::mul_scalar(other, self)
+                }
+            }
+        )*
+    }
+}
+
+impl_tensor_scalar_mul!(f32, f64, i32, i64, u32, u64);
 
 impl<B, const D: usize, K> core::ops::Neg for Tensor<B, D, K>
 where
@@ -4396,7 +4426,7 @@ where
 {
     type Output = Self;
 
-    fn neg(self) -> Self {
+    fn neg(self) -> Self::Output {
         Tensor::neg(self)
     }
 }

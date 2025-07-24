@@ -3,7 +3,7 @@ use core::cmp::Ordering;
 use crate::{
     Distribution,
     cast::ToElement,
-    quantization::{QuantizationScheme, QuantizationType},
+    quantization::{QuantInputType, QuantScheme},
 };
 #[cfg(feature = "cubecl")]
 use cubecl::flex32;
@@ -281,7 +281,7 @@ make_element!(
         flex32::from_elem(sample)
     },
     cmp |a: &flex32, b: &flex32| a.total_cmp(b),
-    dtype DType::F32,
+    dtype DType::Flex32,
     min flex32::from_f32(half::f16::MIN.to_f32_const()),
     max flex32::from_f32(half::f16::MAX.to_f32_const())
 );
@@ -304,6 +304,7 @@ make_element!(
 pub enum DType {
     F64,
     F32,
+    Flex32,
     F16,
     BF16,
     I64,
@@ -315,7 +316,44 @@ pub enum DType {
     U16,
     U8,
     Bool,
-    QFloat(QuantizationScheme),
+    QFloat(QuantScheme),
+}
+
+#[cfg(feature = "cubecl")]
+impl From<cubecl::ir::Elem> for DType {
+    fn from(value: cubecl::ir::Elem) -> Self {
+        match value {
+            cubecl::ir::Elem::Float(float_kind) => match float_kind {
+                cubecl::ir::FloatKind::F16 => DType::F16,
+                cubecl::ir::FloatKind::BF16 => DType::BF16,
+                cubecl::ir::FloatKind::Flex32 => DType::Flex32,
+                cubecl::ir::FloatKind::F32 => DType::F32,
+                cubecl::ir::FloatKind::F64 => DType::F64,
+                cubecl::ir::FloatKind::TF32 => panic!("Not a valid DType for tensors."),
+                cubecl::ir::FloatKind::E2M1
+                | cubecl::ir::FloatKind::E2M3
+                | cubecl::ir::FloatKind::E3M2
+                | cubecl::ir::FloatKind::E4M3
+                | cubecl::ir::FloatKind::E5M2
+                | cubecl::ir::FloatKind::UE8M0 => {
+                    unimplemented!("Not yet supported, will be used for quantization")
+                }
+            },
+            cubecl::ir::Elem::Int(int_kind) => match int_kind {
+                cubecl::ir::IntKind::I8 => DType::I8,
+                cubecl::ir::IntKind::I16 => DType::I16,
+                cubecl::ir::IntKind::I32 => DType::I32,
+                cubecl::ir::IntKind::I64 => DType::I64,
+            },
+            cubecl::ir::Elem::UInt(uint_kind) => match uint_kind {
+                cubecl::ir::UIntKind::U8 => DType::U8,
+                cubecl::ir::UIntKind::U16 => DType::U16,
+                cubecl::ir::UIntKind::U32 => DType::U32,
+                cubecl::ir::UIntKind::U64 => DType::U64,
+            },
+            _ => panic!("Not a valid DType for tensors."),
+        }
+    }
 }
 
 impl DType {
@@ -324,6 +362,7 @@ impl DType {
         match self {
             DType::F64 => core::mem::size_of::<f64>(),
             DType::F32 => core::mem::size_of::<f32>(),
+            DType::Flex32 => core::mem::size_of::<f32>(),
             DType::F16 => core::mem::size_of::<f16>(),
             DType::BF16 => core::mem::size_of::<bf16>(),
             DType::I64 => core::mem::size_of::<i64>(),
@@ -335,11 +374,8 @@ impl DType {
             DType::U16 => core::mem::size_of::<u16>(),
             DType::U8 => core::mem::size_of::<u8>(),
             DType::Bool => core::mem::size_of::<bool>(),
-            DType::QFloat(scheme) => match scheme {
-                QuantizationScheme::PerTensor(_mode, QuantizationType::QInt8)
-                | QuantizationScheme::PerBlock(_mode, QuantizationType::QInt8, ..) => {
-                    core::mem::size_of::<i8>()
-                }
+            DType::QFloat(scheme) => match scheme.q_type {
+                QuantInputType::QInt8 => core::mem::size_of::<i8>(),
             },
         }
     }
@@ -362,6 +398,7 @@ impl DType {
         match self {
             DType::F64 => "f64",
             DType::F32 => "f32",
+            DType::Flex32 => "flex32",
             DType::F16 => "f16",
             DType::BF16 => "bf16",
             DType::I64 => "i64",
@@ -379,7 +416,7 @@ impl DType {
 }
 
 #[allow(missing_docs)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum FloatDType {
     F64,
     F32,

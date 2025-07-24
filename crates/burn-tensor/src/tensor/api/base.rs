@@ -14,14 +14,14 @@ use serde::{Deserialize, Deserializer};
 
 use serde::{Serialize, Serializer};
 
-use crate::tensor::api::narrow::narrow;
+use super::{Slice, TensorMetadata, Transaction};
+use crate::indexing::{AsIndex, canonicalize_dim, wrap_index};
 use crate::{
-    Bool, Float, Int, Shape, TensorData, TensorKind, backend::Backend, check, ops::Device,
+    Bool, ElementConversion, Float, Int, Shape, TensorData, TensorKind, backend::Backend, check,
+    ops::Device,
 };
 use crate::{DType, Element, TensorPrimitive};
 use crate::{cast::ToElement, check::TensorCheck};
-
-use super::{TensorMetadata, Transaction};
 
 /// A tensor with a given backend, shape and data type.
 ///
@@ -94,6 +94,24 @@ where
     B: Backend,
     K: BasicOps<B>,
 {
+    /// Executes an operation on the tensor and modifies its value.
+    ///
+    /// # Notes
+    ///
+    /// This won't necessarily reuse the same tensor data/buffer, but it should if there is
+    /// no other reference pointing to the same tensor.
+    ///
+    /// Wrapping operations with inplace is not an optimization, it's mainly there if you
+    /// want to mutate a tensor by using owned operations. A plausible usage would be to
+    /// update the weights of a mutable model reference.
+    pub fn inplace<F: FnOnce(Self) -> Self>(&mut self, func: F) {
+        let mut tensor_owned = Tensor::empty([0; D], &self.device());
+        core::mem::swap(&mut tensor_owned, self);
+
+        let mut tensor_new = func(tensor_owned);
+        core::mem::swap(&mut tensor_new, self);
+    }
+
     /// Converts the tensor into a primitive tensor.
     pub fn into_primitive(self) -> K::Primitive {
         self.primitive
@@ -117,8 +135,8 @@ where
     ///
     /// # Arguments
     ///
-    /// - shape: The shape of the tensor.
-    /// - device: The device where the tensor will be created.
+    /// - `shape`: The shape of the tensor.
+    /// - `device`: The device where the tensor will be created.
     ///
     /// # Example
     /// ```rust
@@ -824,15 +842,207 @@ where
         self.reshape(shape)
     }
 
+    /// Roll operation along a specific dimension; wrapping around the elements.
+    ///
+    /// ## Parameters
+    ///
+    /// - `shift`: The roll extent; supports negative values and wraps around.
+    /// - `dim`: The dimension to roll; supports negative indexing.
+    ///
+    /// ## Returns
+    ///
+    /// A new tensor with the specified dimension rolled by the given shift amount.
+    pub fn roll_dim<Shift, Dim>(self, shift: Shift, dim: Dim) -> Self
+    where
+        Shift: AsIndex,
+        Dim: AsIndex,
+    {
+        let dim = canonicalize_dim(dim, D, false);
+        let size = self.shape().dims[dim];
+        if size == 0 {
+            // If the dimension is empty, return the tensor as is.
+            return self;
+        }
+
+        let shift = wrap_index(shift, size);
+        if shift == 0 {
+            // If the shift is zero, return the tensor as is.
+            return self;
+        }
+
+        self.unchecked_roll_dim(shift, dim)
+    }
+
+    /// Internal implementation of `roll_dim` that does not canonicalize dimensions or shifts.
+    ///
+    /// ## Parameters
+    ///
+    /// - `shift`: The number of positions to shift; must be (0 < shift < size).
+    /// - `dim`: The dimension to roll; must be a valid index for the tensor's shape.
+    ///
+    /// ## Returns
+    ///
+    /// A new tensor with the specified dimension rolled by the given shift amount.
+    #[inline(always)]
+    fn unchecked_roll_dim(self, shift: usize, dim: usize) -> Self {
+        #[cfg(debug_assertions)]
+        {
+            let size = self.shape().dims[dim];
+            assert!(
+                0 < shift && shift < size,
+                "Expected: 0 < shift < size: found shift={shift}, size={size}",
+            );
+            assert!(
+                dim < self.shape().num_dims(),
+                "Expected: dim < num_dims: found dim={dim}, num_dims={size}",
+            );
+        }
+
+        Tensor::cat(
+            vec![
+                self.clone().slice_dim(dim, shift..),
+                self.slice_dim(dim, ..shift),
+            ],
+            dim,
+        )
+    }
+
+    /// Roll operation.
+    ///
+    /// Note: unlike ``pytorch``, `dims` and `shifts` must have the same length.
+    ///
+    /// A given `dim` may be rolled multiple times, and the shifts will be applied sequentially.
+    ///
+    /// ## Parameters
+    ///
+    /// - `shifts`: A slice of shifts corresponding to each dimension;
+    ///   supports negative values and wraps around.
+    /// - `dims`: A slice of dimensions to roll; supports negative indexing.
+    ///
+    /// ## Returns
+    ///
+    /// A new tensor with the specified dimensions rolled by the given shifts.
+    pub fn roll<Shift, Dim>(self, shifts: &[Shift], dims: &[Dim]) -> Self
+    where
+        Shift: AsIndex,
+        Dim: AsIndex,
+    {
+        assert_eq!(
+            dims.len(),
+            shifts.len(),
+            "Dimensions and shifts must align; found dims={dims:#?}, shifts={shifts:#?}",
+        );
+
+        // This is a fair amount of complexity, which could be replaced
+        // by a simple canonicalization of `dims` and wrapping of `shifts`.
+        // The work is done here to ensure that any roll operation
+        // which could be a no-op is a no-op; simplifying the accounting
+        // needed by backend-specific implementations of the inner roll op.
+
+        let item_count = dims.len();
+
+        let shape = self.shape().dims;
+
+        // Accumulate the effective shifts for each dimension.
+        let mut accumulated_shifts: Vec<isize> = vec![0; shape.len()];
+        for i in 0..item_count {
+            let dim = canonicalize_dim(dims[i], D, false);
+            accumulated_shifts[dim] += shifts[i].index();
+        }
+
+        // Do this after we've checked the validity of `dims` and `shifts`.
+        if self.shape().num_elements() == 0 {
+            // If the tensor is empty, return it as is.
+            return self;
+        }
+
+        // Wrap the accumulated shifts, and filter out empty dimensions.
+        let mut effective_dims: Vec<usize> = Vec::with_capacity(item_count);
+        let mut effective_shifts: Vec<usize> = Vec::with_capacity(item_count);
+        for dim in 0..shape.len() {
+            // `wrap_index` should inline, and has a fast-exit path for zero shifts.
+            let shift = wrap_index(accumulated_shifts[dim], shape[dim]);
+            if shift == 0 {
+                continue;
+            }
+
+            effective_dims.push(dim);
+            effective_shifts.push(shift);
+        }
+
+        // If no shifts are needed, return the original tensor.
+        if effective_shifts.is_empty() {
+            return self;
+        }
+
+        // At this point:
+        // - `dims` contains the effective dimensions to roll, in index order,
+        // - `shifts` contains the effective usize shifts for each dimension.
+        // - Every shift is non-zero, and less than the size of the corresponding dimension.
+        self.unchecked_roll(&effective_shifts, &effective_dims)
+    }
+
+    /// `roll` internal implementation.
+    ///
+    /// ## Parameters
+    ///
+    /// - `shifts`: A slice of shifts corresponding to each dimension;
+    ///   must be non-empty, the same length as `dims`, and all ``1..<size>``.
+    /// - `dims`: A slice of dimensions to roll; must be non-empty;
+    ///   the same length as `shifts`, and must not contain repeats.
+    ///
+    /// ## Panics
+    ///
+    /// Panics if the shifts and dimensions do not align, or if dimensions contain repeats.
+    ///
+    /// ## Returns
+    ///
+    /// A new tensor with the specified dimensions rolled by the given shifts.
+    #[inline(always)]
+    fn unchecked_roll(self, shifts: &[usize], dims: &[usize]) -> Self {
+        #[cfg(debug_assertions)]
+        {
+            assert!(!shifts.is_empty());
+            assert_eq!(
+                shifts.len(),
+                dims.len(),
+                "Shifts and dimensions must align; found {} shifts and {} dims",
+                shifts.len(),
+                dims.len()
+            );
+
+            let mut unique_dims = dims.to_vec();
+            unique_dims.dedup();
+
+            assert_eq!(
+                unique_dims.len(),
+                dims.len(),
+                "Dimensions must not contain repeats; found {} unique dims and {} total dims",
+                unique_dims.len(),
+                dims.len()
+            )
+        }
+
+        let x = self.unchecked_roll_dim(shifts[0], dims[0]);
+
+        if dims.len() == 1 {
+            x
+        } else {
+            x.unchecked_roll(&shifts[1..], &dims[1..])
+        }
+    }
+
     /// Returns a tensor containing the elements selected from the given ranges.
+    ///
+    /// For more complex indexing with different slice ranges, see also the slice
+    /// macro [`s!`](crate::s).
     ///
     /// # Arguments
     ///
     /// * `ranges` - A type implementing the `RangesArg` trait, which can be:
-    ///   - A single `core::ops::Range<usize>` (slice the first dimension)
-    ///   - An array of `core::ops::Range<usize>`
-    ///   - An array of `Option<(i64, i64)>`
-    ///   - An array of `(i64, i64)` tuples
+    ///   - A single range (slice the first dimension)
+    ///   - A single index (slice the first dimension)
+    ///   - An array of ranges
     ///
     /// # Behavior
     ///
@@ -840,7 +1050,6 @@ where
     /// - Missing ranges are treated as full slices if D > D2.
     /// - Handles negative indices by wrapping around from the end of the dimension.
     /// - Clamps ranges to the tensor's dimensions if they exceed the bounds.
-    /// - For `Option<(i64, i64)>` ranges, `None` selects the full range of that dimension.
     ///
     /// # Panics
     ///
@@ -851,7 +1060,7 @@ where
     ///
     /// ```rust
     /// use burn_tensor::backend::Backend;
-    /// use burn_tensor::{Tensor, Shape};
+    /// use burn_tensor::{Tensor, Shape, s};
     ///
     /// fn example<B: Backend>() {
     ///     let device = B::Device::default();
@@ -868,13 +1077,17 @@ where
     ///
     ///     // Using negative indices
     ///     let tensor = Tensor::<B, 1, burn_tensor::Int>::arange(0..5, &device);
-    ///     let slice = tensor.slice([(1, -1)]); // Equivalent to 1..4
+    ///     let slice = tensor.slice([1..-1]); // Equivalent to 1..4
     ///     assert_eq!(slice.into_data().to_vec::<i32>().unwrap(), vec![1i32, 2, 3]);
     ///
-    ///     // Using Option<(i64, i64)>
+    ///     // Using the slice macro to select different ranges
     ///     let tensor = Tensor::<B, 1, burn_tensor::Int>::arange(0..12, &device).reshape([3, 4]);
-    ///     let slice = tensor.slice([Some((1, -1)), None]); // Select rows 1 and 2, all columns
+    ///     let slice = tensor.slice(s![1.., ..]); // Select rows 1 and 2, all columns
     ///     assert_eq!(slice.dims(), [2, 4]);
+    ///
+    ///     let tensor = Tensor::<B, 1, burn_tensor::Int>::arange(0..16, &device).reshape([2, 4, 2]);
+    ///     let slice = tensor.slice(s![1.., 1..=3, -1]);
+    ///     assert_eq!(slice.dims(), [1, 3, 1]);
     /// }
     /// ```
     ///
@@ -912,17 +1125,88 @@ where
     ///     println!("{:?}", tensor_sliced.dims()); // [2, 3, 3]
     /// }
     /// ```
-    pub fn slice_assign<const D2: usize>(
-        self,
-        ranges: [core::ops::Range<usize>; D2],
-        values: Self,
-    ) -> Self {
+    ///
+    /// # Note
+    ///
+    /// This function uses the `RangesArg` trait for flexible range specification. The trait
+    /// handles the conversion of various range formats and applies clamping and negative
+    /// index handling internally.
+    pub fn slice_assign<const D2: usize, R: RangesArg<D2>>(self, ranges: R, values: Self) -> Self {
+        let ranges = ranges.into_ranges(self.shape());
         check!(TensorCheck::slice_assign::<D, D2>(
             &self.shape(),
             &values.shape(),
             &ranges
         ));
         Self::new(K::slice_assign(self.primitive, &ranges, values.primitive))
+    }
+
+    /// Returns a copy of the current tensor with the selected elements changed to the new ones at
+    /// the selected indices.
+    ///
+    /// # Panics
+    ///
+    /// - If a range exceeds the number of elements on a dimension.
+    /// - If the given values don't match the given ranges.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use burn_tensor::backend::Backend;
+    /// use burn_tensor::Tensor;
+    ///
+    /// fn example<B: Backend>() {
+    ///   let device = B::Device::default();
+    ///   let tensor = Tensor::<B, 3>::ones([2, 3, 3], &device);
+    ///   let tensor_sliced = tensor.slice_fill([0..1, 0..1, 0..1], 2.0);
+    ///   println!("{:?}", tensor_sliced.dims()); // [2, 3, 3]
+    /// }
+    /// ```
+    ///
+    /// # Note
+    ///
+    /// This function uses the `RangesArg` trait for flexible range specification. The trait
+    /// handles the conversion of various range formats and applies clamping and negative
+    /// index handling internally.
+    pub fn slice_fill<const D2: usize, R: RangesArg<D2>, E: ElementConversion>(
+        self,
+        ranges: R,
+        value: E,
+    ) -> Self {
+        let ranges = ranges.into_ranges(self.shape());
+        check!(TensorCheck::slice::<D, D2>(&self.shape(), &ranges));
+
+        Self::new(K::slice_fill(self.primitive, &ranges, value.elem()))
+    }
+
+    /// Returns a new tensor with the specified dimension sliced.
+    ///
+    /// # Arguments
+    ///
+    /// * `dim`: The dimension to slice.
+    /// * `range`: The range to slice the dimension with.
+    ///
+    /// # Returns
+    ///
+    /// A new tensor with the specified dimension sliced.
+    ///
+    /// # Panics
+    ///
+    /// If the range is out of bounds for the specified dimension.
+    ///
+    /// # Note
+    ///
+    /// This function uses the `RangeArg` trait for flexible range specification. The trait
+    /// handles the conversion of various range formats and applies clamping and negative
+    /// index handling internally.
+    pub fn slice_dim<R>(self, dim: usize, range: R) -> Self
+    where
+        R: RangeArg,
+    {
+        check!(TensorCheck::check_dim::<D>(dim));
+        let range = range.into_range(self.shape().dims[dim]);
+
+        Self::new(K::slice_dim(self.primitive, dim, &range))
     }
 
     /// Returns the device of the current tensor.
@@ -1271,7 +1555,23 @@ where
     pub fn narrow(self, dim: usize, start: usize, length: usize) -> Self {
         check!(TensorCheck::dim_ops::<D>("narrow", dim));
         check!(TensorCheck::narrow(&self, dim, start, length));
-        Self::new(narrow::<B, K>(self.primitive, dim, start, length))
+        let dims = self.dims();
+
+        let ranges: [Range<usize>; D] = dims
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                if i == dim {
+                    start..(start + length)
+                } else {
+                    0..*d
+                }
+            })
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+
+        Self::slice(self, ranges)
     }
 
     /// Attempts to split the tensor into a specified number of chunks along a given dimension.
@@ -1316,10 +1616,32 @@ where
     /// ```
     pub fn chunk(self, chunks: usize, dim: usize) -> Vec<Self> {
         check!(TensorCheck::dim_ops::<D>("chunk", dim));
-        K::chunk(self.primitive, chunks, dim)
-            .into_iter()
-            .map(Self::new)
-            .collect()
+        let size = self.shape().dims[dim];
+        if size < chunks {
+            return (0..size)
+                .map(|i| Self::narrow(self.clone(), dim, i, 1))
+                .collect();
+        }
+
+        let mut tensors = Vec::with_capacity(chunks);
+        let mut sum_chunk_size = 0;
+        if size % chunks == 0 {
+            let chunk_size = size / chunks;
+            for _ in 0..chunks {
+                tensors.push(Self::narrow(self.clone(), dim, sum_chunk_size, chunk_size));
+                sum_chunk_size += chunk_size;
+            }
+        } else {
+            let chunk_size = (size / chunks) + 1; // assumes not divisible
+            for _ in 0..chunks - 1 {
+                tensors.push(Self::narrow(self.clone(), dim, sum_chunk_size, chunk_size));
+                sum_chunk_size += chunk_size;
+            }
+            let remainder = size % chunk_size;
+            tensors.push(Self::narrow(self.clone(), dim, sum_chunk_size, remainder));
+        }
+
+        tensors
     }
 
     /// Splits the tensor into chunks of a specified size along a given dimension.
@@ -1358,10 +1680,17 @@ where
             split_size,
             dim
         ));
-        K::split(self.primitive, split_size, dim)
-            .into_iter()
-            .map(Self::new)
-            .collect()
+        let size = self.shape().dims[dim];
+        let mut tensors = Vec::new();
+
+        let mut start = 0;
+        while start < size {
+            let length = usize::min(split_size, size - start);
+            tensors.push(Self::narrow(self.clone(), dim, start, length));
+            start += length;
+        }
+
+        tensors
     }
 
     /// Splits the tensor into chunks with the specified sizes along a given dimension.
@@ -1401,10 +1730,18 @@ where
             &split_sizes,
             dim
         ));
-        K::split_with_sizes(self.primitive, split_sizes, dim)
-            .into_iter()
-            .map(Self::new)
-            .collect()
+        let mut tensors = Vec::new();
+
+        let mut start = 0;
+        for length in split_sizes {
+            if length == 0 {
+                continue;
+            }
+            tensors.push(Self::narrow(self.clone(), dim, start, length));
+            start += length;
+        }
+
+        tensors
     }
 
     /// Tests if any element in the `tensor` evaluates to True.
@@ -1580,8 +1917,8 @@ where
     /// If the tensor doesn't have one element.
     pub async fn into_scalar_async(self) -> K::Elem {
         check!(TensorCheck::into_scalar::<D>(&self.shape()));
-        let x = self.into_data_async().await.iter().next().unwrap();
-        x
+
+        self.into_data_async().await.iter().next().unwrap()
     }
 
     /// Broadcast the tensor to the given shape.
@@ -1724,7 +2061,7 @@ where
                 acc.push_str(", ");
             }
             multi_index[depth] = i;
-            let range: [core::ops::Range<usize>; D] =
+            let range: [Range<usize>; D] =
                 core::array::from_fn(|i| multi_index[i]..multi_index[i] + 1);
 
             let data =
@@ -1733,9 +2070,9 @@ where
             if let Some(data) = data {
                 let elem = data.iter::<<K as BasicOps<B>>::Elem>().next().unwrap();
                 match (precision, K::name()) {
-                    (Some(p), "Float") => acc.push_str(&format!("{:.1$}", elem, p)),
+                    (Some(p), "Float") => acc.push_str(&format!("{elem:.p$}")),
                     (_, "Bool") => acc.push_str(&format!("{}", elem.to_bool())),
-                    _ => acc.push_str(&format!("{:?}", elem)),
+                    _ => acc.push_str(&format!("{elem:?}")),
                 }
             } else {
                 acc.push_str("<Tensor data not available>");
@@ -2112,6 +2449,62 @@ pub trait BasicOps<B: Backend>: TensorKind<B> {
         value: Self::Primitive,
     ) -> Self::Primitive;
 
+    /// Fills the tensor elements corresponding for the given ranges with the given value.
+    ///
+    /// # Arguments
+    ///
+    /// * `tensor` - The tensor.
+    /// * `ranges` - The ranges of the elements to fill.
+    /// * `value` - The value to fill.
+    ///
+    /// # Returns
+    ///
+    /// The tensor with the filled values.
+    ///
+    /// # Remarks
+    ///
+    /// This is a low-level function used internally by the library to call different backend functions
+    /// with static dispatch. It is not designed for direct usage by users, and not recommended to import
+    /// or use this function directly.
+    ///
+    /// For filling values in a tensor, users should prefer the [Tensor::slice_fill](Tensor::slice_fill) function,
+    /// which is more high-level and designed for public use.
+    fn slice_fill(
+        tensor: Self::Primitive,
+        ranges: &[Range<usize>],
+        value: Self::Elem,
+    ) -> Self::Primitive {
+        let slice_shape = Self::slice(tensor.clone(), ranges).shape();
+
+        let value = Self::from_data(TensorData::from([value]), &Self::device(&tensor));
+        let value = Self::expand(value, slice_shape);
+        Self::slice_assign(tensor, ranges, value)
+    }
+
+    /// Slices the tensor along a given dimension with the specified range.
+    ///
+    /// # Arguments
+    ///
+    /// * `tensor` - The tensor to slice.
+    /// * `dim` - The dimension along which to slice.
+    /// * `range` - The range of indices to slice along the specified dimension.
+    ///
+    /// # Returns
+    ///
+    /// The sliced tensor.
+    ///
+    /// # Remarks
+    ///
+    /// This is a low-level function used internally by the library to call different backend functions
+    /// with static dispatch. It is not designed for direct usage by users, and not recommended to import
+    /// or use this function directly.
+    fn slice_dim(tensor: Self::Primitive, dim: usize, range: &Range<usize>) -> Self::Primitive {
+        let mut ranges: Vec<Range<usize>> = tensor.shape().dims.iter().map(|&s| 0..s).collect();
+        ranges[dim] = range.clone();
+
+        Self::slice(tensor, &ranges)
+    }
+
     /// Returns the device on which the tensor is allocated.
     ///
     /// # Arguments
@@ -2171,9 +2564,7 @@ pub trait BasicOps<B: Backend>: TensorKind<B> {
     ///
     /// For extracting the data of a tensor, users should prefer the [Tensor::into_data](Tensor::into_data) function,
     /// which is more high-level and designed for public use.
-    fn into_data_async(
-        tensor: Self::Primitive,
-    ) -> impl Future<Output = TensorData> + 'static + Send;
+    fn into_data_async(tensor: Self::Primitive) -> impl Future<Output = TensorData> + Send;
 
     /// Read the data from the tensor using a transaction.
     ///
@@ -2258,77 +2649,6 @@ pub trait BasicOps<B: Backend>: TensorKind<B> {
     /// For concatenating tensors, users should prefer the [Tensor::cat](Tensor::cat) function,
     /// which is more high-level and designed for public use.
     fn cat(vectors: Vec<Self::Primitive>, dim: usize) -> Self::Primitive;
-
-    /// Attempts to split the tensor along the given dimension into chunks.
-    /// May return less chunks than requested if the tensor size is not divisible by the number of chunks.
-    ///
-    /// When the given dimension is evenly divisible by the number of chunks, the chunks will be of equal size.
-    /// Otherwise all chunks will be of equal size except for the last one.
-    ///
-    /// # Panics
-    ///
-    ///  If the dimension is greater than the number of dimensions of the tensor.
-    ///
-    /// # Returns
-    /// A vector of tensors.
-    ///
-    /// # Remarks
-    ///
-    /// This is a low-level function used internally by the library to call different backend functions
-    /// with static dispatch. It is not designed for direct usage by users, and not recommended to import
-    /// or use this function directly.
-    ///
-    /// To chunk a tensor, users should prefer the [Tensor::chunk](Tensor::chunk) function,
-    /// which is more high-level and designed for public use.
-    fn chunk(tensor: Self::Primitive, chunks: usize, dim: usize) -> Vec<Self::Primitive>;
-
-    /// Splits the tensor into chunks of a specified size along a given dimension.
-    /// Each chunk is a view of the original tensor.
-    ///
-    /// # Panics
-    ///
-    /// If the dimension to split along is greater than the number of dimensions of the tensor.
-    ///
-    /// # Returns
-    ///
-    /// A vector of tensors.
-    ///
-    /// # Remarks
-    /// This is a low-level function used internally by the library to call different backend functions
-    /// with static dispatch. It is not designed for direct usage by users, and not recommended to import
-    /// or use this function directly.
-    ///
-    /// To split a tensor, users should prefer the [Tensor::split](Tensor::split) function,
-    /// which is more high-level and designed for public use.
-    fn split(tensor: Self::Primitive, split_size: usize, dim: usize) -> Vec<Self::Primitive>;
-
-    /// Splits the tensor into chunks with the specified sizes along a given dimension.
-    /// Each chunk is a view of the original tensor.
-    ///
-    /// The sizes of the chunks are specified in the `split_sizes` vector. The sum of the sizes
-    /// in `split_sizes` must equal the size of the tensor along the specified dimension.
-    ///
-    /// # Panics
-    ///
-    /// If the dimension to split along is greater than the number of dimensions of the tensor or
-    /// if the sum of `dim_sizes` does not equal the size of the tensor along `dim`.
-    ///
-    /// # Returns
-    ///
-    /// A vector of tensors.
-    ///
-    /// # Remarks
-    /// This is a low-level function used internally by the library to call different backend functions
-    /// with static dispatch. It is not designed for direct usage by users, and not recommended to import
-    /// or use this function directly.
-    ///
-    /// To split a tensor, users should prefer the [Tensor::split_with_sizes](Tensor::split_with_sizes) function,
-    /// which is more high-level and designed for public use.
-    fn split_with_sizes(
-        tensor: Self::Primitive,
-        split_sizes: Vec<usize>,
-        dim: usize,
-    ) -> Vec<Self::Primitive>;
 
     /// Equates the given tensors.
     ///
@@ -2522,15 +2842,11 @@ impl<B: Backend> BasicOps<B> for Float {
         ranges: &[Range<usize>],
         value: Self::Primitive,
     ) -> Self::Primitive {
-        match (tensor, value) {
-            (TensorPrimitive::Float(tensor), TensorPrimitive::Float(value)) => {
-                TensorPrimitive::Float(B::float_slice_assign(tensor, ranges, value))
-            }
-            (TensorPrimitive::QFloat(tensor), TensorPrimitive::QFloat(value)) => {
-                TensorPrimitive::QFloat(B::q_slice_assign(tensor, ranges, value))
-            }
-            _ => panic!("Primitive type mismatch for tensor and value"),
-        }
+        TensorPrimitive::Float(B::float_slice_assign(
+            tensor.tensor(),
+            ranges,
+            value.tensor(),
+        ))
     }
 
     fn device(tensor: &Self::Primitive) -> Device<B> {
@@ -2653,49 +2969,6 @@ impl<B: Backend> BasicOps<B> for Float {
             TensorPrimitive::QFloat(tensor) => TensorPrimitive::QFloat(B::q_flip(tensor, axes)),
         }
     }
-
-    fn chunk(tensor: Self::Primitive, chunks: usize, dim: usize) -> Vec<Self::Primitive> {
-        match tensor {
-            TensorPrimitive::Float(tensor) => B::float_chunk(tensor, chunks, dim)
-                .into_iter()
-                .map(TensorPrimitive::Float)
-                .collect(),
-            TensorPrimitive::QFloat(tensor) => B::q_chunk(tensor, chunks, dim)
-                .into_iter()
-                .map(TensorPrimitive::QFloat)
-                .collect(),
-        }
-    }
-
-    fn split(tensor: Self::Primitive, split_size: usize, dim: usize) -> Vec<Self::Primitive> {
-        match tensor {
-            TensorPrimitive::Float(tensor) => B::float_split(tensor, split_size, dim)
-                .into_iter()
-                .map(TensorPrimitive::Float)
-                .collect(),
-            TensorPrimitive::QFloat(tensor) => B::q_split(tensor, split_size, dim)
-                .into_iter()
-                .map(TensorPrimitive::QFloat)
-                .collect(),
-        }
-    }
-
-    fn split_with_sizes(
-        tensor: Self::Primitive,
-        split_sizes: Vec<usize>,
-        dim: usize,
-    ) -> Vec<Self::Primitive> {
-        match tensor {
-            TensorPrimitive::Float(tensor) => B::float_split_with_sizes(tensor, split_sizes, dim)
-                .into_iter()
-                .map(TensorPrimitive::Float)
-                .collect(),
-            TensorPrimitive::QFloat(tensor) => B::q_split_with_sizes(tensor, split_sizes, dim)
-                .into_iter()
-                .map(TensorPrimitive::QFloat)
-                .collect(),
-        }
-    }
 }
 
 impl<B: Backend> BasicOps<B> for Int {
@@ -2799,22 +3072,6 @@ impl<B: Backend> BasicOps<B> for Int {
 
     fn flip(tensor: Self::Primitive, axes: &[usize]) -> Self::Primitive {
         B::int_flip(tensor, axes)
-    }
-
-    fn chunk(tensor: Self::Primitive, chunks: usize, dim: usize) -> Vec<Self::Primitive> {
-        B::int_chunk(tensor, chunks, dim)
-    }
-
-    fn split(tensor: Self::Primitive, split_size: usize, dim: usize) -> Vec<Self::Primitive> {
-        B::int_split(tensor, split_size, dim)
-    }
-
-    fn split_with_sizes(
-        tensor: Self::Primitive,
-        split_sizes: Vec<usize>,
-        dim: usize,
-    ) -> Vec<Self::Primitive> {
-        B::int_split_with_sizes(tensor, split_sizes, dim)
     }
 }
 
@@ -2920,22 +3177,6 @@ impl<B: Backend> BasicOps<B> for Bool {
     fn flip(tensor: Self::Primitive, axes: &[usize]) -> Self::Primitive {
         B::bool_flip(tensor, axes)
     }
-
-    fn chunk(tensor: Self::Primitive, chunks: usize, dim: usize) -> Vec<Self::Primitive> {
-        B::bool_chunk(tensor, chunks, dim)
-    }
-
-    fn split(tensor: Self::Primitive, split_size: usize, dim: usize) -> Vec<Self::Primitive> {
-        B::bool_split(tensor, split_size, dim)
-    }
-
-    fn split_with_sizes(
-        tensor: Self::Primitive,
-        split_sizes: Vec<usize>,
-        dim: usize,
-    ) -> Vec<Self::Primitive> {
-        B::bool_split_with_sizes(tensor, split_sizes, dim)
-    }
 }
 
 /// Trait used for movedim arguments
@@ -2999,88 +3240,39 @@ impl MovedimArgs for i32 {
     }
 }
 
+/// Trait used for slice dim arguments.
+pub trait RangeArg {
+    /// Converts into a range for the `tensor.slice_dim()` function
+    fn into_range(self, shape_dim: usize) -> Range<usize>;
+}
+
+impl<T: Into<Slice>> RangeArg for T {
+    fn into_range(self, shape_dim: usize) -> Range<usize> {
+        self.into().into_range(shape_dim)
+    }
+}
+
 /// Trait used for slice arguments
 pub trait RangesArg<const D2: usize> {
-    /// Converts into a set of ranges to `[core::ops::Range<usize>; D2]` for the `tensor.slice()` function
-    fn into_ranges(self, shape: Shape) -> [core::ops::Range<usize>; D2];
-
-    /// Handles negative index values
-    fn handle_negative_index(start: i64, end: i64, dim: usize) -> (usize, usize) {
-        let start = if start < 0 {
-            (dim as i64 + start) as usize
-        } else {
-            start as usize
-        };
-        let end = if end < 0 {
-            (dim as i64 + end) as usize
-        } else {
-            end as usize
-        };
-        (start, end)
-    }
-
-    /// Clamps the range to the shape dimensions
-    fn clamp_range(start: usize, end: usize, dim: usize) -> (usize, usize) {
-        let start = start.clamp(0, dim);
-        let end = end.clamp(0, dim);
-        (start, end)
-    }
+    /// Converts into a set of ranges to `[Range<usize>; D2]` for the `tensor.slice()` function
+    fn into_ranges(self, shape: Shape) -> [Range<usize>; D2];
 }
 
-impl<const D2: usize> RangesArg<D2> for [core::ops::Range<usize>; D2] {
-    fn into_ranges(self, shape: Shape) -> [core::ops::Range<usize>; D2] {
+impl<const D2: usize, T: Into<Slice>> RangesArg<D2> for [T; D2] {
+    fn into_ranges(self, shape: Shape) -> [Range<usize>; D2] {
         // clamp the ranges to the shape dimensions
         let ranges = self
-            .iter()
+            .into_iter()
             .enumerate()
-            .map(|(i, range)| {
-                let (start, end) = Self::clamp_range(range.start, range.end, shape.dims[i]);
-                start..end
-            })
+            .map(|(i, range)| range.into().into_range(shape.dims[i]))
             .collect::<Vec<_>>();
         ranges.try_into().unwrap()
     }
 }
 
-impl<const D2: usize> RangesArg<D2> for [Option<(i64, i64)>; D2] {
-    fn into_ranges(self, shape: Shape) -> [core::ops::Range<usize>; D2] {
-        let ranges = self
-            .iter()
-            .enumerate()
-            .map(|(i, range)| match range {
-                Some((start, end)) => {
-                    let (start, end) = Self::handle_negative_index(*start, *end, shape.dims[i]);
-                    let (start, end) = Self::clamp_range(start, end, shape.dims[i]);
-                    start..end
-                }
-                None => 0..shape.dims[i], // if None, use the full range
-            })
-            .collect::<Vec<_>>();
-
-        ranges.try_into().unwrap()
-    }
-}
-
-impl<const D2: usize> RangesArg<D2> for [(i64, i64); D2] {
-    fn into_ranges(self, shape: Shape) -> [core::ops::Range<usize>; D2] {
-        let ranges = self
-            .iter()
-            .enumerate()
-            .map(|(i, &(start, end))| {
-                let (start, end) = Self::handle_negative_index(start, end, shape.dims[i]);
-                let (start, end) = Self::clamp_range(start, end, shape.dims[i]);
-                start..end
-            })
-            .collect::<Vec<_>>();
-
-        ranges.try_into().unwrap()
-    }
-}
-
-impl RangesArg<1> for core::ops::Range<usize> {
-    fn into_ranges(self, shape: Shape) -> [core::ops::Range<usize>; 1] {
-        let (start, end) = Self::clamp_range(self.start, self.end, shape.dims[0]);
-        [(start..end)]
+impl<T: Into<Slice>> RangesArg<1> for T {
+    fn into_ranges(self, shape: Shape) -> [Range<usize>; 1] {
+        [self.into().into_range(shape.dims[0])]
     }
 }
 
@@ -3218,7 +3410,7 @@ impl<const D1: usize, const D2: usize, E: Element> BroadcastArgs<D1, D2> for [E;
             .rev()
             .collect();
 
-        if new_shape.iter().any(|&x| x == 0) {
+        if new_shape.contains(&0) {
             panic!("Cannot substitute -1 for a non-existing dimension");
         }
 
@@ -3252,5 +3444,82 @@ where
             &<B::Device as Default>::default(),
         );
         Ok(tensor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Shape;
+    use crate::s;
+
+    use super::*;
+
+    #[test]
+    fn slice_range_single_dim_leading() {
+        let shape = Shape::new([8, 4]);
+
+        // Half-open range
+        assert_eq!([0..5], (0..5).into_ranges(shape.clone()));
+        assert_eq!([0..5], [0..5].into_ranges(shape.clone()));
+        assert_eq!([5..7], [-3..-1].into_ranges(shape.clone()));
+
+        // Inclusive range
+        assert_eq!([0..5], (0..=4).into_ranges(shape.clone()));
+        assert_eq!([0..5], [0..=4].into_ranges(shape.clone()));
+        assert_eq!([6..8], [-2..=-1].into_ranges(shape.clone()));
+
+        // Unbounded start
+        assert_eq!([0..3], (..3).into_ranges(shape.clone()));
+        assert_eq!([0..3], [..3].into_ranges(shape.clone()));
+        assert_eq!([0..3], [..-5].into_ranges(shape.clone()));
+
+        // Unbounded end
+        assert_eq!([5..8], (5..).into_ranges(shape.clone()));
+        assert_eq!([5..8], [5..].into_ranges(shape.clone()));
+        assert_eq!([5..8], [-3..].into_ranges(shape.clone()));
+
+        // Full range
+        assert_eq!([0..8], [..].into_ranges(shape));
+    }
+
+    #[test]
+    fn slice_range_multi_dim() {
+        let shape = Shape::new([8, 4]);
+
+        // Multiple ways to provide ranges
+        assert_eq!([0..5, 0..4], [0..5, 0..4].into_ranges(shape.clone()));
+        assert_eq!([0..8, 0..4], [0.., 0..].into_ranges(shape.clone()));
+        assert_eq!([0..8, 0..4], [0..=7, 0..=3].into_ranges(shape.clone()));
+
+        assert_eq!([0..5, 0..3], [0..5, 0..3].into_ranges(shape.clone()));
+
+        assert_eq!([0..8, 0..4], [0.., 0..].into_ranges(shape));
+    }
+
+    #[test]
+    fn slice_range_multi_dim_index() {
+        let shape = Shape::new([8, 4]);
+
+        // Indices (single integer) should also convert to correct range
+        assert_eq!([0..1, 2..3], [0, 2].into_ranges(shape.clone()));
+        assert_eq!([7..8, 3..4], [-1, -1].into_ranges(shape.clone()));
+        assert_eq!([7..8], (-1).into_ranges(shape.clone()));
+        assert_eq!([7..8], 7.into_ranges(shape));
+    }
+
+    #[test]
+    fn slice_range_multi_dim_heterogeneous() {
+        // Slice macro `s![]` can be used to provide different range types
+        let shape = Shape::new([8, 4, 2]);
+        let slice = s![0..5, .., -1];
+        assert_eq!([0..5, 0..4, 1..2], slice.into_ranges(shape));
+
+        let shape = Shape::new([8, 4, 2, 3]);
+        let slice = s![..=4, 0..=3, .., -2..];
+        assert_eq!([0..5, 0..4, 0..2, 1..3], slice.into_ranges(shape));
+
+        let shape = Shape::new([3, 4]);
+        let slice = s![1..-1, ..];
+        assert_eq!([1..2, 0..4], slice.into_ranges(shape));
     }
 }

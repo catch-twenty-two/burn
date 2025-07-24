@@ -8,7 +8,7 @@ use burn_ir::{
     BaseOperationIr, BinaryOpIr, FloatOperationIr, NumericOperationIr, OperationIr, ScalarOpIr,
     TensorIr, UnaryOpIr,
 };
-use burn_tensor::Element;
+use burn_tensor::{DType, Element};
 use cubecl::ir::Elem;
 
 /// The base optimization builder that can be used to fuse all elemwise operations.
@@ -18,7 +18,7 @@ use cubecl::ir::Elem;
 ///
 /// Since this builder supports fusing multiple blocks, you can fuse any compute-bound operations
 /// with the combination of fuse-on-read and fuse-on-write strategy.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct FuseOptimizationBuilder {
     builder: TryFuseBuilder,
     pub(crate) settings: FuseSettings,
@@ -36,6 +36,14 @@ impl OptimizationBuilder<FuseTrace> for FuseOptimizationBuilder {
         }
 
         match op {
+            OperationIr::Drop(tensor) => {
+                if self.num_ops == 0 {
+                    self.status = OptimizationStatus::Closed;
+                    return;
+                }
+
+                self.builder.builder.register_dropped(tensor.id);
+            }
             OperationIr::BaseFloat(ops) => {
                 if !self.register_base(ops) {
                     self.status = OptimizationStatus::Closed;
@@ -112,6 +120,10 @@ impl OptimizationBuilder<FuseTrace> for FuseOptimizationBuilder {
             ready,
             score: self.num_ops as u64,
         }
+    }
+
+    fn clone_dyn(&self) -> Box<dyn OptimizationBuilder<FuseTrace>> {
+        Box::new(self.clone())
     }
 }
 
@@ -212,6 +224,10 @@ impl FuseOptimizationBuilder {
                     return false;
                 }
 
+                if self.input_is_quantized(&desc.input) {
+                    return false;
+                }
+
                 if self.builder.register(|build| {
                     build.input_swap_dims(
                         &desc.input,
@@ -240,6 +256,10 @@ impl FuseOptimizationBuilder {
                 }
 
                 if !self.output_is_compatible(&desc.out) {
+                    return false;
+                }
+
+                if self.input_is_quantized(&desc.input) {
                     return false;
                 }
 
@@ -279,6 +299,9 @@ impl FuseOptimizationBuilder {
             }),
             FloatOperationIr::Erf(desc) => self
                 .register_unary_ops(desc, |input, out| FuseOp::Erf(UnaryFuseArgs { input, out })),
+            FloatOperationIr::Sqrt(desc) => self.register_unary_ops(desc, |input, out| {
+                FuseOp::Sqrt(UnaryFuseArgs { input, out })
+            }),
             FloatOperationIr::Recip(desc) => self.register_unary_ops(desc, |input, out| {
                 FuseOp::Recip(UnaryFuseArgs { input, out })
             }),
@@ -447,9 +470,13 @@ impl FuseOptimizationBuilder {
                     return false;
                 }
 
+                if self.input_is_quantized(&desc.tensor) {
+                    return false;
+                }
+
                 self.builder.register(|build| {
                     let input = build.input_indexed(&desc.tensor)?;
-                    let indices = build.input(&desc.indices)?;
+                    let indices = build.input_indexed(&desc.indices)?;
                     let output = build.output(&desc.out)?;
 
                     build.register_operation(FuseOp::Gather {
@@ -464,6 +491,10 @@ impl FuseOptimizationBuilder {
             }
             NumericOperationIr::Select(desc) => {
                 if !self.output_is_compatible(&desc.out) {
+                    return false;
+                }
+
+                if self.input_is_quantized(&desc.tensor) {
                     return false;
                 }
 
@@ -494,6 +525,10 @@ impl FuseOptimizationBuilder {
             return false;
         }
 
+        if self.input_is_quantized(&desc.lhs) {
+            return false;
+        }
+
         self.builder.register(|build| {
             let lhs = build.input(&desc.lhs)?;
             let rhs = build.input(&desc.rhs)?;
@@ -513,6 +548,10 @@ impl FuseOptimizationBuilder {
             return false;
         }
 
+        if self.input_is_quantized(&desc.input) {
+            return false;
+        }
+
         self.builder.register(|build| {
             let input = build.input(&desc.input)?;
             let out = build.output(&desc.out)?;
@@ -529,6 +568,10 @@ impl FuseOptimizationBuilder {
             return false;
         }
 
+        if self.input_is_quantized(&desc.lhs) {
+            return false;
+        }
+
         self.builder.register(|build| {
             let elem = desc.lhs.dtype;
             let lhs = build.input(&desc.lhs)?;
@@ -539,6 +582,10 @@ impl FuseOptimizationBuilder {
 
             Some(())
         })
+    }
+
+    fn input_is_quantized(&self, input: &TensorIr) -> bool {
+        matches!(input.dtype, DType::QFloat(_scheme))
     }
 
     fn output_is_compatible(&mut self, out: &TensorIr) -> bool {
@@ -587,17 +634,19 @@ impl FuseOptimizationBuilder {
         if updated != out.shape {
             return false;
         }
+
         self.current_output_shape.clone_from_slice(&out.shape);
 
         true
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 /// Builder wrapper to limit the number of bindings in generated kernels.
 struct TryFuseBuilder {
     builder: FuseTraceBuilder,
     max_bindings: u32,
+    max_ops: u32,
     added_ops: bool,
 }
 
@@ -606,11 +655,18 @@ impl TryFuseBuilder {
         Self {
             builder: FuseTraceBuilder::new(bool_precision, settings),
             max_bindings,
+            // A good default, avoid errors with for loops over only memory
+            // bound operations.
+            max_ops: 64,
             added_ops: false,
         }
     }
 
     fn register(&mut self, add_ops: impl FnOnce(&mut FuseTraceBuilder) -> Option<()>) -> bool {
+        if self.builder.num_ops_fused() > self.max_ops {
+            return false;
+        }
+
         // Always allow the first operation to be added.
         if !self.added_ops {
             self.added_ops = true;

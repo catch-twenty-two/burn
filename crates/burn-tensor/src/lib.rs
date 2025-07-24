@@ -28,6 +28,9 @@ pub use tensor::*;
 pub use burn_common::reader::*; // Useful so that backends don't have to add `burn_common` as a dependency.
 
 #[cfg(feature = "cubecl")]
+pub use cubecl::flex32;
+
+#[cfg(feature = "cubecl")]
 mod cube {
     use cubecl::ir::{Elem, FloatKind, IntKind, UIntKind};
 
@@ -36,6 +39,7 @@ mod cube {
             match dtype {
                 crate::DType::F64 => Elem::Float(FloatKind::F64),
                 crate::DType::F32 => Elem::Float(FloatKind::F32),
+                crate::DType::Flex32 => Elem::Float(FloatKind::Flex32),
                 crate::DType::F16 => Elem::Float(FloatKind::F16),
                 crate::DType::BF16 => Elem::Float(FloatKind::BF16),
                 crate::DType::I64 => Elem::Int(IntKind::I64),
@@ -86,13 +90,12 @@ mod cube_cuda {
     }
 }
 
-#[cfg(target_os = "linux")]
 #[cfg(feature = "cubecl-hip")]
 mod cube_hip {
     use crate::backend::{DeviceId, DeviceOps};
-    use cubecl::hip::HipDevice;
+    use cubecl::hip::AmdDevice;
 
-    impl DeviceOps for HipDevice {
+    impl DeviceOps for AmdDevice {
         fn id(&self) -> DeviceId {
             DeviceId::new(0, self.index as u32)
         }

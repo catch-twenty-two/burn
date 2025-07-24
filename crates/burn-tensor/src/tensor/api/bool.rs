@@ -1,5 +1,5 @@
 use crate::{Bool, Int, Shape, Tensor, TensorData, TensorPrimitive, backend::Backend};
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 
 use crate::try_read_sync;
 
@@ -29,7 +29,7 @@ where
         Tensor::new(B::bool_into_int(self.primitive))
     }
 
-    /// Convert the bool tensor into an float tensor.
+    /// Convert the bool tensor into a float tensor.
     pub fn float(self) -> Tensor<B, D> {
         Tensor::new(TensorPrimitive::Float(B::bool_into_float(self.primitive)))
     }
@@ -49,7 +49,7 @@ where
         Tensor::new(B::bool_or(self.primitive, rhs.primitive))
     }
 
-    /// Compute the indices of the elements that are non-zero.
+    /// Compute the indices of `true` elements in the tensor (i.e., non-zero for boolean tensors).
     ///
     /// # Returns
     ///
@@ -60,17 +60,25 @@ where
             .expect("Failed to read tensor data synchronously. Try using nonzero_async instead.")
     }
 
-    /// Compute the indices of the elements that are non-zero.
+    /// Compute the indices of `true` elements in the tensor (i.e., non-zero for boolean tensors).
     ///
     /// # Returns
     ///
     /// A vector of tensors, one for each dimension of the given tensor, containing the indices of
     /// the non-zero elements in that dimension.
     pub async fn nonzero_async(self) -> Vec<Tensor<B, 1, Int>> {
-        B::bool_nonzero(self.primitive)
-            .await
+        let indices = self.argwhere_async().await;
+
+        if indices.shape().num_elements() == 0 {
+            // Return empty vec when all elements are zero
+            return vec![];
+        }
+
+        let dims = indices.shape().dims;
+        indices
+            .chunk(dims[1], 1)
             .into_iter()
-            .map(Tensor::new)
+            .map(|t| t.reshape(Shape::new([dims[0]])))
             .collect()
     }
 

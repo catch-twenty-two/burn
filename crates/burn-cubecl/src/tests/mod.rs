@@ -40,6 +40,7 @@ macro_rules! testgen_all {
     () => {
         use burn_tensor::{Float, Int, Bool};
         $crate::testgen_all!([Float], [Int], [Bool]);
+
     };
     ([$($float:ident),*], [$($int:ident),*], [$($bool:ident),*]) => {
         mod cube {
@@ -86,6 +87,7 @@ macro_rules! testgen_all {
         }
         mod cube_fusion {
             burn_cubecl::testgen_jit_fusion!([$($float),*], [$($int),*], [$($bool),*]);
+            burn_fusion::memory_checks!();
         }
     };
 }
@@ -120,10 +122,9 @@ macro_rules! testgen_jit {
         burn_tensor::testgen_all!([$($float),*], [$($int),*], [$($bool),*]);
         burn_autodiff::testgen_all!([$($float),*]);
 
-        // Not all ops are implemented for quantization yet, notably missing:
-        // `q_swap_dims`, `q_permute`, `q_flip`, `q_gather`, `q_select`, `q_slice`, `q_expand`
-        // burn_tensor::testgen_quantization!();
-        // test quantization
+        use burn_tensor::tests::qtensor::*;
+
+        burn_tensor::testgen_q_matmul!();
         burn_tensor::testgen_calibration!();
         burn_tensor::testgen_scheme!();
         burn_tensor::testgen_quantize!();

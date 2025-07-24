@@ -1,5 +1,5 @@
-use alloc::sync::Arc;
-use burn_ir::{BackendIr, OperationIr, TensorHandle, TensorId, TensorIr};
+use burn_common::future::DynFut;
+use burn_ir::{BackendIr, OperationIr, TensorHandle, TensorIr};
 use burn_tensor::{
     DType, Shape, TensorData,
     backend::{Backend, DeviceId, DeviceOps},
@@ -102,11 +102,11 @@ macro_rules! impl_multi_backend_types {
                     }
                 }
 
-                async fn read_tensor(&self, tensor: TensorIr) -> TensorData {
+                fn read_tensor(&self, tensor: TensorIr) -> DynFut<TensorData> {
                     match self {
-                        Self::$DefaultBackend(runner) => runner.read_tensor(tensor).await,
+                        Self::$DefaultBackend(runner) => runner.read_tensor(tensor),
                         $(
-                            Self::$OtherBackend(runner) => runner.read_tensor(tensor).await,
+                            Self::$OtherBackend(runner) => runner.read_tensor(tensor),
                         )+
                     }
                 }
@@ -115,12 +115,12 @@ macro_rules! impl_multi_backend_types {
                     match self {
                         Self::$DefaultBackend(runner) => {
                             let desc = runner.register_tensor_data_desc(data);
-                            RouterTensor::new(Arc::new(desc.id), desc.shape, desc.dtype, self.clone())
+                            RouterTensor::new(desc.id, desc.shape, desc.dtype, self.clone())
                         }
                         $(
                             Self::$OtherBackend(runner) => {
                                 let desc = runner.register_tensor_data_desc(data);
-                                RouterTensor::new(Arc::new(desc.id), desc.shape, desc.dtype, self.clone())
+                                RouterTensor::new(desc.id, desc.shape, desc.dtype, self.clone())
                             }
                         )+
                     }
@@ -130,12 +130,12 @@ macro_rules! impl_multi_backend_types {
                     match self {
                         Self::$DefaultBackend(runner) => {
                             let desc = runner.register_empty_tensor_desc(shape, dtype);
-                            RouterTensor::new(Arc::new(desc.id), desc.shape, desc.dtype, self.clone())
+                            RouterTensor::new(desc.id, desc.shape, desc.dtype, self.clone())
                         }
                         $(
                             Self::$OtherBackend(runner) => {
                             let desc = runner.register_empty_tensor_desc(shape, dtype);
-                                RouterTensor::new(Arc::new(desc.id), desc.shape, desc.dtype, self.clone())
+                                RouterTensor::new(desc.id, desc.shape, desc.dtype, self.clone())
                             }
                         )+
                     }
@@ -145,12 +145,12 @@ macro_rules! impl_multi_backend_types {
                     match self {
                         Self::$DefaultBackend(runner) => {
                             let desc = runner.register_float_tensor_desc(shape, dtype);
-                            RouterTensor::new(Arc::new(desc.id), desc.shape, desc.dtype, self.clone())
+                            RouterTensor::new(desc.id, desc.shape, desc.dtype, self.clone())
                         }
                         $(
                             Self::$OtherBackend(runner) => {
                             let desc = runner.register_float_tensor_desc(shape, dtype);
-                                RouterTensor::new(Arc::new(desc.id), desc.shape, desc.dtype, self.clone())
+                                RouterTensor::new(desc.id, desc.shape, desc.dtype, self.clone())
                             }
                         )+
                     }
@@ -165,26 +165,13 @@ macro_rules! impl_multi_backend_types {
                     }
                 }
 
-                fn register_orphan(&self, id: &TensorId) {
+                fn sync(&self) {
                     match self {
-                        Self::$DefaultBackend(runner) => runner.register_orphan(id),
+                        Self::$DefaultBackend(runner) => runner.sync(),
                         $(
-                            Self::$OtherBackend(runner) => runner.register_orphan(id),
-                        )+
-                    }
-                }
-
-                fn sync(&self) -> impl core::future::Future<Output = ()> + Send {
-                    let fut: core::pin::Pin<Box<dyn core::future::Future<Output = ()> + Send>> = match self {
-                        Self::$DefaultBackend(runner) => Box::pin(runner.sync()),
-                        $(
-                            Self::$OtherBackend(runner) => Box::pin(runner.sync()),
+                            Self::$OtherBackend(runner) => runner.sync(),
                         )+
                     };
-
-                    async move  {
-                        fut.await;
-                    }
                 }
 
                 fn seed(&self, seed: u64) {

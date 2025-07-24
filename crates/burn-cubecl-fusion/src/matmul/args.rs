@@ -1,5 +1,5 @@
 use cubecl::{
-    linalg::matmul::components::{
+    matmul::components::{
         MatmulPrecision,
         global::{Quantization, args::MatmulArgs},
     },
@@ -282,15 +282,9 @@ impl MatmulArgs for FusedMatmulArgs {
     }
 
     fn quantization<MP: MatmulPrecision>(_state: &Self::State<MP::EI, MP::EO>) -> Quantization<MP> {
-        comptime! {
-            panic!("Unsupported yet");
-        };
-
-        #[allow(unreachable_code)]
-        Quantization::<MP> {
-            scaling: MP::ES::from_int(0),
-        }
+        todo!()
     }
+
     /// Reinterpret lhs as tensor map
     fn as_tensor_map_lhs<EI: Numeric, EO: Numeric>(_state: &Self::State<EI, EO>) -> TensorMap<EI> {
         comptime! {
@@ -354,8 +348,8 @@ impl CubeType for FusedMatmulState {
     type ExpandType = FusedMatmulStateExpand;
 }
 
-impl Init for FusedMatmulStateExpand {
-    fn init(self, _context: &mut Scope) -> Self {
+impl IntoMut for FusedMatmulStateExpand {
+    fn into_mut(self, _context: &mut Scope) -> Self {
         self
     }
 }

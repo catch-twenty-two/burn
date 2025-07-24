@@ -1,6 +1,9 @@
 use crate::{CubeRuntime, element::CubeElement, kernel, tensor::CubeTensor};
-use burn_tensor::{Shape, TensorData};
-use cubecl::tensor_vectorization_factor;
+use burn_tensor::{
+    Shape, TensorData,
+    quantization::{QTensorPrimitive, QuantLevel},
+};
+use cubecl::{server::BindingWithMeta, tensor_vectorization_factor};
 
 pub(crate) fn from_data<R: CubeRuntime>(data: TensorData, device: &R::Device) -> CubeTensor<R> {
     let shape: Shape = (&data.shape).into();
@@ -11,20 +14,26 @@ pub(crate) fn from_data<R: CubeRuntime>(data: TensorData, device: &R::Device) ->
 }
 
 pub(crate) async fn into_data<R: CubeRuntime, E: CubeElement>(tensor: CubeTensor<R>) -> TensorData {
-    let tensor = kernel::into_contiguous(tensor);
+    let tensor = kernel::into_contiguous_aligned(tensor);
 
-    let bytes = tensor.client.read_one_async(tensor.handle.binding()).await;
-    let actual_len = tensor.shape.num_elements() * size_of::<E>();
+    let elem_size = size_of::<E>();
+    let shape = tensor.shape.dims.clone();
+    let actual_len = tensor.shape.num_elements() * elem_size;
+    let binding = BindingWithMeta::new(tensor.handle.binding(), shape, tensor.strides, elem_size);
+    let bytes = tensor.client.read_one_tensor_async(binding).await;
     TensorData::new(E::from_bytes(&bytes[..actual_len]).to_vec(), tensor.shape)
 }
 
 /// Read data from a `CubeTensor` synchronously
 #[allow(unused, reason = "useful for debugging kernels")]
 pub fn into_data_sync<R: CubeRuntime, E: CubeElement>(tensor: CubeTensor<R>) -> TensorData {
-    let tensor = kernel::into_contiguous(tensor);
+    let tensor = kernel::into_contiguous_aligned(tensor);
 
-    let bytes = tensor.client.read_one(tensor.handle.binding());
-    let actual_len = tensor.shape.num_elements() * size_of::<E>();
+    let elem_size = size_of::<E>();
+    let shape = tensor.shape.dims.clone();
+    let actual_len = tensor.shape.num_elements() * elem_size;
+    let binding = BindingWithMeta::new(tensor.handle.binding(), shape, tensor.strides, elem_size);
+    let bytes = tensor.client.read_one_tensor(binding);
     TensorData::new(E::from_bytes(&bytes[..actual_len]).to_vec(), tensor.shape)
 }
 
@@ -72,6 +81,30 @@ pub fn permute<R: CubeRuntime>(mut tensor: CubeTensor<R>, axes: &[usize]) -> Cub
     tensor
 }
 
+/// Permute a tensor's dimensions from NCHW to NHWC, or the N-dimensional equivalent
+pub fn permute_nchw_to_nhwc<R: CubeRuntime>(tensor: CubeTensor<R>) -> CubeTensor<R> {
+    let rank = tensor.shape.num_dims();
+    let c_dim = 1;
+
+    let mut dims = vec![0];
+    dims.extend(2..rank);
+    dims.push(c_dim);
+
+    permute(tensor, &dims)
+}
+
+/// Permute a tensor's dimensions from NHWC to NCHW, or the N-dimensional equivalent
+pub fn permute_nhwc_to_nchw<R: CubeRuntime>(tensor: CubeTensor<R>) -> CubeTensor<R> {
+    let rank = tensor.shape.num_dims();
+    let c_dim = rank - 1;
+
+    let mut dims = vec![0];
+    dims.push(c_dim);
+    dims.extend(1..c_dim);
+
+    permute(tensor, &dims)
+}
+
 pub(crate) fn expand<R: CubeRuntime>(tensor: CubeTensor<R>, target_shape: Shape) -> CubeTensor<R> {
     let ndims_in = tensor.shape.num_dims();
     let ndims_out = target_shape.num_dims();
@@ -97,8 +130,7 @@ pub(crate) fn expand<R: CubeRuntime>(tensor: CubeTensor<R>, target_shape: Shape)
                 } else {
                     // Error handling: Dimension mismatch for broadcasting
                     panic!(
-                        "Dimension mismatch: cannot broadcast dimension {} of tensor to target shape",
-                        tensor_dim
+                        "Dimension mismatch: cannot broadcast dimension {tensor_dim} of tensor to target shape"
                     );
                 }
             } else {
@@ -112,6 +144,13 @@ pub(crate) fn expand<R: CubeRuntime>(tensor: CubeTensor<R>, target_shape: Shape)
         }
     }
 
+    // Extra check to ensure block scales must be properly handled once they're added
+    if tensor.qparams.is_some() {
+        match tensor.scheme().level {
+            QuantLevel::Tensor => {}
+        }
+    }
+
     CubeTensor {
         client: tensor.client,
         device: tensor.device,
@@ -119,6 +158,7 @@ pub(crate) fn expand<R: CubeRuntime>(tensor: CubeTensor<R>, target_shape: Shape)
         strides: new_strides,
         handle: tensor.handle,
         dtype: tensor.dtype,
+        qparams: tensor.qparams,
     }
 }
 
@@ -127,20 +167,38 @@ pub fn reshape<R: CubeRuntime>(tensor: CubeTensor<R>, shape: Shape) -> CubeTenso
     // TODO: Not force standard layout all the time (improve performance).
     let tensor = kernel::into_contiguous(tensor);
 
-    CubeTensor::new_contiguous(
+    let mut out = CubeTensor::new_contiguous(
         tensor.client,
         tensor.device,
         shape,
         tensor.handle,
         tensor.dtype,
-    )
+    );
+    out.qparams = tensor.qparams;
+    out
 }
 
-pub(crate) fn max_vectorization<R: CubeRuntime>(tensor: &CubeTensor<R>) -> u8 {
+pub(crate) fn max_line_size<R: CubeRuntime>(tensor: &CubeTensor<R>) -> u8 {
     tensor_vectorization_factor(
         R::supported_line_sizes(),
         &tensor.shape.dims,
         &tensor.strides,
         tensor.shape.num_dims() - 1,
     )
+}
+
+pub(crate) fn max_line_size_many<R: CubeRuntime>(tensors: &[&CubeTensor<R>], dim: usize) -> u8 {
+    let vec = tensors
+        .iter()
+        .map(|tensor| {
+            tensor_vectorization_factor(
+                R::supported_line_sizes(),
+                &tensor.shape.dims,
+                &tensor.strides,
+                dim,
+            )
+        })
+        .min();
+
+    vec.unwrap_or(0)
 }

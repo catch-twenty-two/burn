@@ -2,10 +2,12 @@
 mod tests {
     use super::*;
     use burn_cubecl::{
-        kernel::{conv::nchw_to_nhwc, into_contiguous},
+        kernel::{conv::layout_swap::nchw_to_nhwc, into_contiguous},
         tests::into_data_sync,
     };
     use burn_tensor::{Distribution, Tensor, backend::Backend, module};
+    use burn_tensor::{Tolerance, ops::FloatElem};
+    type FT = FloatElem<TestBackend>;
 
     #[test]
     fn conv2d_should_match_reference_backend() {
@@ -28,7 +30,7 @@ mod tests {
 
         output
             .into_data()
-            .assert_approx_eq(&output_ref.into_data(), 3);
+            .assert_approx_eq::<FT>(&output_ref.into_data(), Tolerance::default());
     }
 
     #[test]
@@ -50,9 +52,10 @@ mod tests {
         let output = module::conv2d(input, weight, Some(bias), options.clone());
         let output_ref = module::conv2d(input_ref, weight_ref, Some(bias_ref), options);
 
+        let tolerance = Tolerance::default();
         output
             .into_data()
-            .assert_approx_eq(&output_ref.into_data(), 2);
+            .assert_approx_eq::<FT>(&output_ref.into_data(), tolerance);
     }
 
     /// Regression test for bias loader in new implicit GEMM
@@ -77,9 +80,10 @@ mod tests {
         let output_ref =
             module::conv2d(input_ref, weight_ref, Some(bias_ref), options).permute([0, 2, 3, 1]);
 
+        let tolerance = Tolerance::default();
         output
             .into_data()
-            .assert_approx_eq(&output_ref.into_data(), 2);
+            .assert_approx_eq::<FT>(&output_ref.into_data(), tolerance);
     }
 
     #[test]
@@ -99,8 +103,10 @@ mod tests {
                 .tensor(),
         );
 
-        into_data_sync::<TestRuntime, Float>(output)
-            .assert_approx_eq(&into_data_sync::<TestRuntime, Float>(output_ref), 4);
+        into_data_sync::<TestRuntime, Float>(output).assert_approx_eq::<FT>(
+            &into_data_sync::<TestRuntime, Float>(output_ref),
+            Tolerance::default(),
+        );
     }
 
     /// Regression test for transpose kernel that was causing corruption with 17-64 in channels and
@@ -122,7 +128,9 @@ mod tests {
                 .tensor(),
         );
 
-        into_data_sync::<TestRuntime, Float>(output)
-            .assert_approx_eq(&into_data_sync::<TestRuntime, Float>(output_ref), 4);
+        into_data_sync::<TestRuntime, Float>(output).assert_approx_eq::<FT>(
+            &into_data_sync::<TestRuntime, Float>(output_ref),
+            Tolerance::default(),
+        );
     }
 }

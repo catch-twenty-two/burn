@@ -58,8 +58,8 @@ impl CubeType for Arg {
     type ExpandType = Self;
 }
 
-impl Init for Arg {
-    fn init(self, _context: &mut Scope) -> Self {
+impl IntoMut for Arg {
+    fn into_mut(self, _context: &mut Scope) -> Self {
         self
     }
 }
@@ -89,6 +89,7 @@ pub enum FuseOp {
     Sin(UnaryFuseArgs),
     Tanh(UnaryFuseArgs),
     Erf(UnaryFuseArgs),
+    Sqrt(UnaryFuseArgs),
     Recip(UnaryFuseArgs),
     Assign(UnaryFuseArgs),
     Equal(BinaryFuseArgs),
@@ -134,6 +135,7 @@ impl FuseOp {
             FuseOp::Tanh(op) => op.out.precision().into_elem(),
             FuseOp::Erf(op) => op.out.precision().into_elem(),
             FuseOp::Recip(op) => op.out.precision().into_elem(),
+            FuseOp::Sqrt(op) => op.out.precision().into_elem(),
             FuseOp::Assign(op) => op.out.precision().into_elem(),
             FuseOp::Equal(op) => op.lhs.precision().into_elem(),
             FuseOp::Lower(op) => op.lhs.precision().into_elem(),
@@ -196,14 +198,15 @@ impl<R: Runtime> GlobalArgsLaunch<'_, R> {
                     shape.swap(dims.0 as usize, dims.1 as usize);
                     shape
                 }
-                VirtualLayout::Reshaped(start) => {
-                    let start = *start as usize;
+                VirtualLayout::Reshaped { reshape_pos, .. } => {
+                    let start = *reshape_pos as usize * rank;
                     let end = start + rank;
                     self.reshapes.values[start..end]
                         .iter()
                         .map(|s| s.elem as usize)
                         .collect()
                 }
+                VirtualLayout::Shape(original, _) => self.shape(original),
             },
         }
     }
@@ -338,6 +341,7 @@ pub struct BinaryFuseArgs {
 /// Precisions supported by [element wise operations](ElemwiseOp).
 pub enum FusePrecision {
     F32,
+    Flex32,
     F16,
     BF16,
     I64,
@@ -358,6 +362,7 @@ impl From<Elem> for FusePrecision {
                 cubecl::ir::FloatKind::F16 => Self::F16,
                 cubecl::ir::FloatKind::BF16 => Self::BF16,
                 cubecl::ir::FloatKind::F32 => Self::F32,
+                cubecl::ir::FloatKind::Flex32 => Self::Flex32,
                 _ => panic!("Unsupported precision for fusion: {value}"),
             },
             Elem::Int(kind) => match kind {
@@ -381,6 +386,7 @@ impl FusePrecision {
     pub fn into_elem(self) -> Elem {
         match self {
             FusePrecision::F32 => Elem::Float(cubecl::ir::FloatKind::F32),
+            FusePrecision::Flex32 => Elem::Float(cubecl::ir::FloatKind::Flex32),
             FusePrecision::F16 => Elem::Float(cubecl::ir::FloatKind::F16),
             FusePrecision::BF16 => Elem::Float(cubecl::ir::FloatKind::BF16),
             FusePrecision::I64 => Elem::Int(cubecl::ir::IntKind::I64),
@@ -400,6 +406,7 @@ impl From<DType> for FusePrecision {
     fn from(value: DType) -> Self {
         match value {
             DType::F32 => Self::F32,
+            DType::Flex32 => Self::Flex32,
             DType::F16 => Self::F16,
             DType::BF16 => Self::BF16,
             DType::I64 => Self::I64,
@@ -411,7 +418,7 @@ impl From<DType> for FusePrecision {
             DType::U16 => Self::U16,
             DType::U8 => Self::U8,
             DType::Bool => Self::Bool,
-            _ => panic!("Unsupported"),
+            _ => panic!("Unsupported precision for fusion: {value:?}"),
         }
     }
 }
@@ -438,8 +445,13 @@ pub enum RefLayout {
 /// A virtual layout is always contiguous and retrieve its shape from either a reshape tensor or a
 /// tensor with swap dimensions.
 pub enum VirtualLayout {
-    Reshaped(u32),
+    /// Virtual tensor with the provided shape id and contiguous strides.
+    Reshaped { reshape_pos: u32, line_size: u32 },
+    /// Virtual tensor with the same shape as the given input, but with swap dims and contiguous
+    /// strides.
     SwapDims(Arg, (u32, u32)),
+    /// Virtual tensor with the same shape as the given input, but with contiguous strides.
+    Shape(Arg, u32),
 }
 
 impl Arg {

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use burn::tensor::backend::Backend;
 use text_classification::AgNewsDataset;
 
@@ -78,6 +80,16 @@ mod wgpu {
 
     pub fn run() {
         launch::<Wgpu<ElemType, i32>>(WgpuDevice::default());
+    }
+}
+
+#[cfg(feature = "metal")]
+mod metal {
+    use crate::{ElemType, launch};
+    use burn::backend::metal::{Metal, MetalDevice};
+
+    pub fn run() {
+        launch::<Metal<ElemType, i32>>(MetalDevice::default());
     }
 }
 
